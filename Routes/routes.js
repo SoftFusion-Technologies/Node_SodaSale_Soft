@@ -34,6 +34,16 @@ import {
 } from '../Controllers/CTS_TB_Users.js';
 // Importar controladores de usuarios fin
 
+// Importar controladores de producto fin
+import {
+  OBRS_Productos_CTS,
+  OBR_Producto_CTS,
+  CR_Producto_CTS,
+  UR_Producto_CTS,
+  ER_Producto_CTS,
+  UR_Producto_Estado_CTS
+} from '../Controllers/Productos/CTS_TB_Productos.js';
+// Importar controladores de producto fin
 
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
@@ -64,4 +74,27 @@ router.put('/usuarios/:id', authenticateToken, UR_Usuario_CTS);
 router.delete('/usuarios/:id', authenticateToken, ER_Usuario_CTS);
 router.get('/usuarios', authenticateToken, OBRS_Usuarios_CTS);
 
+
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'productos'
+// ----------------------------------------------------------------
+// Listado con paginación flexible
+// GET /productos?q=&estado=&presentacion=&page=&pageSize=&limit=&offset=&mode=keyset&last_id=&orderBy=&orderDir=&count=0
+router.get('/productos', OBRS_Productos_CTS);
+
+// Detalle
+router.get('/productos/:id', OBR_Producto_CTS);
+
+// Alta
+router.post('/productos', CR_Producto_CTS);
+
+// Update
+router.put('/productos/:id', UR_Producto_CTS);
+
+// Baja (lógica por defecto; hard con ?hard=1)
+router.delete('/productos/:id', ER_Producto_CTS);
+
+// Cambiar estado directo (útil para activar/inactivar desde el listado)
+router.patch('/productos/:id/estado', UR_Producto_Estado_CTS);
 export default router;
