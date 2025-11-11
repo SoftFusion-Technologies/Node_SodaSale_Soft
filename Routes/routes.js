@@ -34,7 +34,7 @@ import {
 } from '../Controllers/CTS_TB_Users.js';
 // Importar controladores de usuarios fin
 
-// Importar controladores de producto fin
+// Importar controladores de producto inicio
 import {
   OBRS_Productos_CTS,
   OBR_Producto_CTS,
@@ -44,6 +44,36 @@ import {
   UR_Producto_Estado_CTS
 } from '../Controllers/Productos/CTS_TB_Productos.js';
 // Importar controladores de producto fin
+
+// Importar controladores de geografia inicio
+import {
+  OBRS_Ciudades_CTS,
+  OBR_Ciudad_CTS,
+  CR_Ciudad_CTS,
+  UR_Ciudad_CTS,
+  PR_Ciudad_Estado_CTS,
+  ER_Ciudad_CTS
+} from '../Controllers/Geografia/CTS_TB_Ciudades.js';
+
+import {
+  OBRS_Localidades_CTS,
+  OBR_Localidad_CTS,
+  CR_Localidad_CTS,
+  UR_Localidad_CTS,
+  PR_Localidad_Estado_CTS,
+  ER_Localidad_CTS
+} from '../Controllers/Geografia/CTS_TB_Localidades.js';
+
+import {
+  OBRS_Barrios_CTS,
+  OBR_Barrio_CTS,
+  CR_Barrio_CTS,
+  UR_Barrio_CTS,
+  PR_Barrio_Estado_CTS,
+  ER_Barrio_CTS
+} from '../Controllers/Geografia/CTS_TB_Barrios.js';
+
+// Importar controladores de geografia fin
 
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
@@ -74,8 +104,6 @@ router.put('/usuarios/:id', authenticateToken, UR_Usuario_CTS);
 router.delete('/usuarios/:id', authenticateToken, ER_Usuario_CTS);
 router.get('/usuarios', authenticateToken, OBRS_Usuarios_CTS);
 
-
-
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'productos'
 // ----------------------------------------------------------------
@@ -97,4 +125,34 @@ router.delete('/productos/:id', ER_Producto_CTS);
 
 // Cambiar estado directo (útil para activar/inactivar desde el listado)
 router.patch('/productos/:id/estado', UR_Producto_Estado_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'ciudades'
+// ----------------------------------------------------------------
+router.get('/geo/ciudades', OBRS_Ciudades_CTS);
+router.get('/geo/ciudades/:id', OBR_Ciudad_CTS);
+router.post('/geo/ciudades', CR_Ciudad_CTS);
+router.put('/geo/ciudades/:id', UR_Ciudad_CTS);
+router.patch('/geo/ciudades/:id/estado', PR_Ciudad_Estado_CTS);
+router.delete('/geo/ciudades/:id', ER_Ciudad_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'localidades'
+// ----------------------------------------------------------------
+router.get('/geo/localidades', OBRS_Localidades_CTS);
+router.get('/geo/localidades/:id', OBR_Localidad_CTS);
+router.post('/geo/localidades', CR_Localidad_CTS);
+router.put('/geo/localidades/:id', UR_Localidad_CTS);
+router.patch('/geo/localidades/:id/estado', PR_Localidad_Estado_CTS);
+router.delete('/geo/localidades/:id', ER_Localidad_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'barrios'
+// ----------------------------------------------------------------
+router.get('/geo/barrios', OBRS_Barrios_CTS);
+router.get('/geo/barrios/:id', OBR_Barrio_CTS);
+router.post('/geo/barrios', CR_Barrio_CTS);
+router.put('/geo/barrios/:id', UR_Barrio_CTS);
+router.patch('/geo/barrios/:id/estado', PR_Barrio_Estado_CTS);
+router.delete('/geo/barrios/:id', ER_Barrio_CTS);
 export default router;

@@ -291,35 +291,52 @@ export const UR_Producto_CTS = async (req, res) => {
 };
 
 // ---------- ELIMINAR (DELETE /productos/:id) ----------
-// Por defecto hacemos "baja lógica" (estado='inactivo') para no romper referencias.
-// Si querés borrado físico: pasá ?hard=1 (bajo tu responsabilidad, papá 😅).
 export const ER_Producto_CTS = async (req, res) => {
   try {
-    const { id } = req.params;
-    const hard = ['1', 'true', 'sí', 'si'].includes(
-      String(req.query.hard || '').toLowerCase()
+    const id = Number(req.params.id);
+    // Hard delete por defecto. Si viene ?soft=1 (o true), hace baja lógica.
+    const soft = ['1', 'true', 'si', 'sí', 'soft'].includes(
+      String(req.query.soft || '').toLowerCase()
     );
 
-    const existe = await ProductosModel.findByPk(id);
-    if (!existe)
-      return res.status(404).json({ mensajeError: 'Producto no encontrado' });
+    console.log('[ER_Producto_CTS] INICIO', { id, soft });
 
-    if (hard) {
-      await ProductosModel.destroy({ where: { id } });
-      return res.json({ message: 'Producto eliminado (hard delete)' });
-    } else {
-      await ProductosModel.update({ estado: 'inactivo' }, { where: { id } });
-      const inactivado = await ProductosModel.findByPk(id);
-      return res.json({
-        message: 'Producto dado de baja (estado=inactivo)',
-        producto: inactivado
-      });
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ code: 'BAD_REQUEST', mensajeError: 'ID inválido' });
     }
+
+    const existe = await ProductosModel.findByPk(id);
+    if (!existe) {
+      return res.status(404).json({ code: 'NOT_FOUND', mensajeError: 'Producto no encontrado' });
+    }
+
+    if (!soft) {
+      // HARD DELETE (default)
+      const deleted = await ProductosModel.destroy({ where: { id }, limit: 1 });
+      console.log('[ER_Producto_CTS] destroy → deleted count:', deleted);
+      if (deleted === 0) {
+        return res.status(404).json({ code: 'NOT_FOUND', mensajeError: 'No se pudo eliminar (ya no existe)' });
+      }
+      return res.status(204).send(); // 204 No Content
+    }
+
+    // SOFT DELETE (solo si ?soft=1)
+    const [upd] = await ProductosModel.update(
+      { estado: 'inactivo' },
+      { where: { id }, limit: 1 }
+    );
+    console.log('[ER_Producto_CTS] update estado=inactivo → updated:', upd);
+    const inactivado = await ProductosModel.findByPk(id);
+    return res.json({
+      message: 'Producto dado de baja (estado=inactivo)',
+      producto: inactivado
+    });
   } catch (error) {
     console.error('Error al eliminar producto:', error);
-    return res.status(500).json({ mensajeError: error?.message || error });
+    return res.status(500).json({ code: 'SERVER_ERROR', mensajeError: error?.message || String(error) });
   }
 };
+
 
 // ---------- (Opcional) Cambiar estado directo (PATCH /productos/:id/estado) ----------
 export const UR_Producto_Estado_CTS = async (req, res) => {
