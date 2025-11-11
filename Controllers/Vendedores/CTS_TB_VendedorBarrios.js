@@ -27,9 +27,9 @@ import db from '../../DataBase/db.js';
 import VendedoresModel from '../../Models/Vendedores/MD_TB_Vendedores.js';
 import VendedorBarrioModel from '../../Models/Vendedores/MD_TB_VendedorBarrios.js';
 
-import BarriosModel from '../../Models/Geografia/MD_TB_Barrios.js';
-import LocalidadesModel from '../../Models/Geografia/MD_TB_Localidades.js';
-import CiudadesModel from '../../Models/Geografia/MD_TB_Ciudades.js';
+import { BarriosModel } from '../../Models/Geografia/MD_TB_Barrios.js';
+import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
+import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 
 // ---------- includes de geografía (para joins lindos)
 const incGeo = [
@@ -79,171 +79,217 @@ const metaFrom = (total, page, limit) => {
   };
 };
 
-// =====================================================
-// LISTADO GLOBAL (GET /vendedor_barrios)
-// Filtros: vendedor_id, barrio_id, vigente=1, estado, desde/hasta (rango en asignado_desde)
-// Orden/paginación: orderBy=id/asignado_desde/… | orderDir=ASC/DESC | page/limit
-// includeGeo=1 para joins de barrio→localidad→ciudad
-// =====================================================
+const buildIncludes = () => [
+  {
+    model: VendedoresModel,
+    as: 'vendedor',
+    attributes: ['id', 'nombre', 'estado']
+  },
+  {
+    model: BarriosModel,
+    as: 'barrio',
+    attributes: ['id', 'nombre', 'localidad_id'],
+    include: [
+      {
+        model: LocalidadesModel,
+        as: 'localidad',
+        attributes: ['id', 'nombre', 'ciudad_id'],
+        include: [
+          {
+            model: CiudadesModel,
+            as: 'ciudad',
+            attributes: ['id', 'nombre', 'provincia']
+          }
+        ]
+      }
+    ]
+  }
+];
+
+const parsePagination = (req) => {
+  const page = Math.max(1, parseInt(req.query.page ?? '1', 10));
+  const limit = Math.min(
+    100,
+    Math.max(1, parseInt(req.query.limit ?? '20', 10))
+  );
+  const offset = (page - 1) * limit;
+  return { page, limit, offset };
+};
+
+// GET /vendedor_barrios
 export const OBRS_VB_CTS = async (req, res) => {
   try {
-    const vendedor_id = normInt(req.query.vendedor_id);
-    const barrio_id = normInt(req.query.barrio_id);
-    const vigente = String(req.query.vigente || '') === '1';
-    const estado = (req.query.estado || '').trim(); // 'activo'|'inactivo'
-    const desde = parseDateTime(req.query.desde);
-    const hasta = parseDateTime(req.query.hasta);
-
-    const page = Math.max(1, normInt(req.query.page, 1));
-    const limit = Math.min(100, Math.max(1, normInt(req.query.limit, 20)));
-    const orderBy = [
-      'id',
-      'asignado_desde',
-      'asignado_hasta',
-      'created_at'
-    ].includes(req.query.orderBy)
-      ? req.query.orderBy
-      : 'asignado_desde';
-    const orderDir =
-      String(req.query.orderDir || 'DESC').toUpperCase() === 'ASC'
-        ? 'ASC'
-        : 'DESC';
+    const { page, limit, offset } = parsePagination(req);
+    const {
+      q,
+      vendedor_id,
+      ciudad_id,
+      localidad_id,
+      barrio_id,
+      estado, // 'activo' | 'inactivo'
+      vigentes, // 1 = solo asignado_hasta NULL, 0 = solo cerradas
+      orderBy = 'asignado_desde',
+      orderDir = 'DESC'
+    } = req.query;
 
     const where = {};
-    if (Number.isFinite(vendedor_id)) where.vendedor_id = vendedor_id;
-    if (Number.isFinite(barrio_id)) where.barrio_id = barrio_id;
-    if (vigente) where.asignado_hasta = { [Op.is]: null };
-    if (estado && ['activo', 'inactivo'].includes(estado))
-      where.estado = estado;
-    if (desde || hasta) {
-      where.asignado_desde = {};
-      if (desde) where.asignado_desde[Op.gte] = desde;
-      if (hasta) where.asignado_desde[Op.lte] = hasta;
-    }
+    if (estado) where.estado = estado;
+    if (vigentes === '1' || vigentes === 1)
+      where.asignado_hasta = { [Op.is]: null };
+    if (vigentes === '0' || vigentes === 0)
+      where.asignado_hasta = { [Op.not]: null };
+    if (barrio_id) where.barrio_id = Number(barrio_id);
+    if (vendedor_id) where.vendedor_id = Number(vendedor_id);
 
-    const include =
-      String(req.query.includeGeo || '') === '1' ? incGeo : undefined;
+    const include = buildIncludes();
+
+    // Filtros por atributos de los includes
+    const and = [];
+    if (q && q.trim()) {
+      const like = `%${q.trim()}%`;
+      and.push({
+        [Op.or]: [
+          { '$vendedor.nombre$': { [Op.like]: like } },
+          { '$barrio.nombre$': { [Op.like]: like } }
+        ]
+      });
+    }
+    if (ciudad_id)
+      and.push({ '$barrio.localidad.ciudad.id$': Number(ciudad_id) });
+    if (localidad_id)
+      and.push({ '$barrio.localidad.id$': Number(localidad_id) });
+
+    const finalWhere = and.length ? { [Op.and]: [where, ...and] } : where;
+
+    const order = [
+      [orderBy, orderDir.toUpperCase() === 'ASC' ? 'ASC' : 'DESC']
+    ];
 
     const { rows, count } = await VendedorBarrioModel.findAndCountAll({
-      where,
+      where: finalWhere,
       include,
-      order: [
-        [orderBy, orderDir],
-        ['id', 'DESC']
-      ],
+      attributes: { exclude: [] }, // si querés ocultar vigente_flag: exclude: ['vigente_flag']
       limit,
-      offset: (page - 1) * limit
+      offset,
+      order,
+      subQuery: false // necesario para filtrar/ordenar por campos incluidos ($...$)
     });
 
-    return res.json({ data: rows, meta: metaFrom(count, page, limit) });
-  } catch (error) {
-    console.error('OBRS_VB_CTS error:', error);
-    return res
-      .status(500)
-      .json({
-        code: 'SERVER_ERROR',
-        mensajeError: 'No se pudo obtener el listado de asignaciones.'
-      });
+    return res.json({
+      data: rows,
+      meta: {
+        total: count,
+        page,
+        limit,
+        totalPages: Math.ceil(count / limit),
+        hasPrev: page > 1,
+        hasNext: offset + rows.length < count
+      }
+    });
+  } catch (err) {
+    console.error('OBRS_VB_CTS error', err);
+    return res.status(500).json({ error: 'Error listando asignaciones' });
   }
 };
 
-// =====================================================
-// LISTADO POR VENDEDOR (GET /vendedores/:id/barrios)
-// Query: vigente=1|0, estado, includeGeo=1, page/limit/order
-// =====================================================
+// GET /vendedores/:id/barrios
 export const OBRS_VB_PorVendedor_CTS = async (req, res) => {
   try {
-    const vendedor_id = normInt(req.params.id, NaN);
-    if (!Number.isFinite(vendedor_id)) {
-      return res
-        .status(400)
-        .json({
-          code: 'BAD_REQUEST',
-          mensajeError: 'ID de vendedor inválido.'
-        });
-    }
+    const { page, limit, offset } = parsePagination(req);
+    const { id } = req.params;
+    const {
+      vigentes,
+      estado,
+      orderBy = 'asignado_desde',
+      orderDir = 'DESC'
+    } = req.query;
 
-    const vigente = String(req.query.vigente || '') === '1';
-    const estado = (req.query.estado || '').trim();
-
-    const page = Math.max(1, normInt(req.query.page, 1));
-    const limit = Math.min(100, Math.max(1, normInt(req.query.limit, 20)));
-    const orderBy = [
-      'id',
-      'asignado_desde',
-      'asignado_hasta',
-      'created_at'
-    ].includes(req.query.orderBy)
-      ? req.query.orderBy
-      : 'asignado_desde';
-    const orderDir =
-      String(req.query.orderDir || 'DESC').toUpperCase() === 'ASC'
-        ? 'ASC'
-        : 'DESC';
-
-    const include =
-      String(req.query.includeGeo || '') === '1' ? incGeo : undefined;
-
-    const where = { vendedor_id };
-    if (vigente) where.asignado_hasta = { [Op.is]: null };
-    if (estado && ['activo', 'inactivo'].includes(estado))
-      where.estado = estado;
+    const where = { vendedor_id: Number(id) };
+    if (estado) where.estado = estado;
+    if (vigentes === '1' || vigentes === 1)
+      where.asignado_hasta = { [Op.is]: null };
+    if (vigentes === '0' || vigentes === 0)
+      where.asignado_hasta = { [Op.not]: null };
 
     const { rows, count } = await VendedorBarrioModel.findAndCountAll({
       where,
-      include,
-      order: [
-        [orderBy, orderDir],
-        ['id', 'DESC']
-      ],
+      include: buildIncludes(),
       limit,
-      offset: (page - 1) * limit
+      offset,
+      order: [[orderBy, orderDir.toUpperCase() === 'ASC' ? 'ASC' : 'DESC']],
+      subQuery: false
     });
 
-    return res.json({ data: rows, meta: metaFrom(count, page, limit) });
-  } catch (error) {
-    console.error('OBRS_VB_PorVendedor_CTS error:', error);
+    return res.json({
+      data: rows,
+      meta: {
+        total: count,
+        page,
+        limit,
+        totalPages: Math.ceil(count / limit),
+        hasPrev: page > 1,
+        hasNext: offset + rows.length < count
+      }
+    });
+  } catch (err) {
+    console.error('OBRS_VB_PorVendedor_CTS error', err);
     return res
       .status(500)
-      .json({
-        code: 'SERVER_ERROR',
-        mensajeError: 'No se pudo obtener las asignaciones del vendedor.'
-      });
+      .json({ error: 'Error listando asignaciones por vendedor' });
   }
 };
 
 // =====================================================
 // CREATE (POST /vendedores/:id/barrios)
-// body: { barrio_id, asignado_desde?, asignado_hasta?, estado?, autoClose? }
-// - Valida vendedor/barrio existentes
-// - Si autoClose=1: cierra vigente del barrio (si la hay) antes de crear
-// - Si hay colisión de únicos → DUPLICATE/HAS_VIGENTE
+// body: { barrio_id, asignado_desde?, asignado_hasta?, estado? }
+// - Valida vendedor/barrio
+// - Permite múltiples vendedores vigentes en el mismo barrio
+// - Impide duplicar vigencia para el mismo par (vendedor,barrio)
 // =====================================================
+function parseDateFlexible(v) {
+  if (!v) return null;
+  if (v instanceof Date && !isNaN(v)) return v;
+  if (typeof v === 'string') {
+    const s = v.trim();
+
+    // DD-MM-YYYY [HH:mm[:ss]]
+    const m1 = s.match(
+      /^(\d{2})[-\/](\d{2})[-\/](\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/
+    );
+    if (m1) {
+      const [, dd, mm, yyyy, HH = '00', MM = '00', SS = '00'] = m1;
+      const d = new Date(Date.UTC(+yyyy, +mm - 1, +dd, +HH, +MM, +SS));
+      return isNaN(d) ? null : d;
+    }
+
+    // ISO u otros formatos nativos válidos
+    const d2 = new Date(s);
+    return isNaN(d2) ? null : d2;
+  }
+  return null;
+}
+
 export const CR_VB_Asigna_CTS = async (req, res) => {
   const t = await db.transaction();
   try {
-    const vendedor_id = normInt(req.params.id, NaN);
+    const vendedor_id = Number(req.params.id);
     if (!Number.isFinite(vendedor_id)) {
-      await t.rollback();
-      return res
-        .status(400)
-        .json({
-          code: 'BAD_REQUEST',
-          mensajeError: 'ID de vendedor inválido.'
-        });
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'ID de vendedor inválido.'
+      });
     }
 
-    const { barrio_id, asignado_desde, asignado_hasta, estado, autoClose } =
+    const { barrio_id, asignado_desde, asignado_hasta, estado } =
       req.body || {};
-    const bId = normInt(barrio_id, NaN);
+    const bId = Number(barrio_id);
     if (!Number.isFinite(bId)) {
-      await t.rollback();
-      return res
-        .status(400)
-        .json({
-          code: 'BAD_REQUEST',
-          mensajeError: 'barrio_id es obligatorio y debe ser numérico.'
-        });
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'barrio_id es obligatorio y debe ser numérico.'
+      });
     }
 
     const [vend, barr] = await Promise.all([
@@ -251,61 +297,51 @@ export const CR_VB_Asigna_CTS = async (req, res) => {
       BarriosModel.findByPk(bId, { transaction: t })
     ]);
     if (!vend) {
-      await t.rollback();
+      if (!t.finished) await t.rollback();
       return res
         .status(404)
         .json({ code: 'NOT_FOUND', mensajeError: 'Vendedor no encontrado.' });
     }
     if (!barr) {
-      await t.rollback();
+      if (!t.finished) await t.rollback();
       return res
         .status(404)
         .json({ code: 'NOT_FOUND', mensajeError: 'Barrio no encontrado.' });
     }
 
-    // Si piden autoClose → cerramos la vigente de ese barrio (con cualquier vendedor)
-    const doAutoClose = String(autoClose || req.query.autoClose || '') === '1';
-    if (doAutoClose) {
-      const vigenteBarrio = await VendedorBarrioModel.findOne({
-        where: { barrio_id: bId, asignado_hasta: { [Op.is]: null } },
-        transaction: t,
-        lock: t.LOCK.UPDATE
+    // No duplicar vigencia para el MISMO par (vendedor, barrio)
+    const yaVigenteMismoPar = await VendedorBarrioModel.count({
+      where: { vendedor_id, barrio_id: bId, asignado_hasta: { [Op.is]: null } },
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
+    if (yaVigenteMismoPar > 0) {
+      if (!t.finished) await t.rollback();
+      return res.status(409).json({
+        code: 'DUPLICATE',
+        mensajeError:
+          'Ese vendedor ya tiene una asignación vigente para este barrio.',
+        tips: [
+          'Cerrá la vigente actual del par o usá una fecha de inicio posterior.'
+        ]
       });
-      if (vigenteBarrio) {
-        const fin = parseDateTime(asignado_desde) || new Date();
-        // cerramos la anterior justo antes del inicio nuevo (1 segundo menos)
-        const finPrev = new Date(fin.getTime() - 1000);
-        await vigenteBarrio.update(
-          { asignado_hasta: finPrev },
-          { transaction: t }
-        );
-      }
-    } else {
-      // Si NO autoClose y hay vigente en ese barrio → bloquear
-      const yaHayVigente = await VendedorBarrioModel.count({
-        where: { barrio_id: bId, asignado_hasta: { [Op.is]: null } },
-        transaction: t
-      });
-      if (yaHayVigente > 0) {
-        await t.rollback();
-        return res.status(409).json({
-          code: 'HAS_VIGENTE',
-          mensajeError:
-            'El barrio ya tiene una asignación vigente. Usá autoClose=1 para cerrar la vigente y reasignar.',
-          tips: [
-            'Reintentá con autoClose=1',
-            'O cerrá manualmente la vigente y volvé a crear'
-          ]
-        });
-      }
+    }
+
+    const ahora = new Date();
+    const desde = parseDateFlexible(asignado_desde) || ahora;
+
+    // Si envían hasta FUTURO => guardamos NULL para que quede vigente (regla del DDL)
+    let hasta = parseDateFlexible(asignado_hasta);
+    if (hasta && hasta > ahora) {
+      hasta = null;
     }
 
     const nuevo = await VendedorBarrioModel.create(
       {
         vendedor_id,
         barrio_id: bId,
-        asignado_desde: parseDateTime(asignado_desde) || new Date(),
-        asignado_hasta: parseDateTime(asignado_hasta) || null,
+        asignado_desde: desde,
+        asignado_hasta: hasta, // null si era futuro → queda vigente
         estado: ['activo', 'inactivo'].includes(String(estado))
           ? estado
           : 'activo'
@@ -315,31 +351,39 @@ export const CR_VB_Asigna_CTS = async (req, res) => {
 
     await t.commit();
 
-    // devuelve con geo incluída para que el front pinte lindo
-    const withGeo = await VendedorBarrioModel.findByPk(nuevo.id, {
-      include: incGeo
-    });
-    return res.status(201).json(withGeo);
+    // Post-commit: enrich sin romper respuesta
+    try {
+      const withGeo = await VendedorBarrioModel.findByPk(nuevo.id, {
+        include: incGeo()
+      });
+      // opcional: exponer 'vigente' semántico (NULL o > ahora)
+      const json = withGeo?.toJSON ? withGeo.toJSON() : withGeo;
+      json.vigente =
+        !json.asignado_hasta || new Date(json.asignado_hasta) > new Date();
+      return res.status(201).json(json || nuevo);
+    } catch (e) {
+      const json = nuevo?.toJSON ? nuevo.toJSON() : nuevo;
+      json.vigente =
+        !json.asignado_hasta || new Date(json.asignado_hasta) > new Date();
+      return res.status(201).json(json);
+    }
   } catch (error) {
-    await t.rollback();
-    console.error('CR_VB_Asigna_CTS error:', error);
-
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
     if (error?.name === 'SequelizeUniqueConstraintError') {
-      // Puede ser por uq_barrio_un_vigente o uq_vendor_barrio_vigente
       return res.status(409).json({
         code: 'DUPLICATE',
         mensajeError:
-          'Restricción de unicidad: ya existe una asignación vigente para ese barrio o para ese par vendedor-barrio.',
-        tips: ['Usá autoClose=1', 'Verificá si ya existe una fila vigente']
+          'Ya existe una asignación vigente para este par vendedor-barrio.',
+        tips: ['Cerrá la vigente actual del par antes de crear otra.']
       });
     }
-
-    return res
-      .status(500)
-      .json({
-        code: 'SERVER_ERROR',
-        mensajeError: 'No se pudo crear la asignación.'
-      });
+    console.error('CR_VB_Asigna_CTS error:', error);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo crear la asignación.'
+    });
   }
 };
 
@@ -379,12 +423,10 @@ export const UR_VB_Cerrar_CTS = async (req, res) => {
     return res.json({ message: 'Asignación cerrada', asignacion: asig });
   } catch (error) {
     console.error('UR_VB_Cerrar_CTS error:', error);
-    return res
-      .status(500)
-      .json({
-        code: 'SERVER_ERROR',
-        mensajeError: 'No se pudo cerrar la asignación.'
-      });
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo cerrar la asignación.'
+    });
   }
 };
 
@@ -422,12 +464,10 @@ export const UR_VB_Estado_CTS = async (req, res) => {
     return res.json({ message: 'Estado actualizado', asignacion: asig });
   } catch (error) {
     console.error('UR_VB_Estado_CTS error:', error);
-    return res
-      .status(500)
-      .json({
-        code: 'SERVER_ERROR',
-        mensajeError: 'No se pudo actualizar el estado.'
-      });
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo actualizar el estado.'
+    });
   }
 };
 
@@ -463,8 +503,8 @@ export const ER_VB_CTS = async (req, res) => {
       return res.status(409).json({
         code: 'HAS_DEPENDENCIES',
         mensajeError:
-          'No se puede eliminar una asignación vigente. Cerrala primero o usá hard=1.',
-        tips: ['PATCH /cerrar con fecha de cierre', 'O reintentá con ?hard=1']
+          'No se puede eliminar una asignación vigente. Cerrala primero.',
+        tips: ['Presiona el botón de color Amarillo que dice CERRAR']
       });
     }
 
@@ -473,22 +513,18 @@ export const ER_VB_CTS = async (req, res) => {
       limit: 1
     });
     if (deleted === 0) {
-      return res
-        .status(404)
-        .json({
-          code: 'NOT_FOUND',
-          mensajeError: 'No se pudo eliminar (ya no existe).'
-        });
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'No se pudo eliminar (ya no existe).'
+      });
     }
     return res.status(204).send();
   } catch (error) {
     console.error('ER_VB_CTS error:', error);
-    return res
-      .status(500)
-      .json({
-        code: 'SERVER_ERROR',
-        mensajeError: 'No se pudo eliminar la asignación.'
-      });
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo eliminar la asignación.'
+    });
   }
 };
 
