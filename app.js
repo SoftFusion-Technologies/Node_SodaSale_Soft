@@ -31,6 +31,10 @@ if (process.env.NODE_ENV !== 'production') {
   dotenv.config();
 }
 import './Models/Geografia/relacionesGeografia.js';
+import initVendedoresRelations from './Models/Vendedores/relacionesVendedores.js';
+
+// …luego de importar/registrar TODOS los modelos:
+initVendedoresRelations();
 // const PORT = process.env.PORT || 3000;
 
 // console.log(process.env.PORT)

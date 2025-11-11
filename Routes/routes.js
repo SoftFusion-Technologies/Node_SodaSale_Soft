@@ -75,6 +75,26 @@ import {
 
 // Importar controladores de geografia fin
 
+// Importar controladores de vendedores inicio
+import {
+  OBRS_Vendedores_CTS,
+  OBR_Vendedor_CTS,
+  CR_Vendedor_CTS,
+  UR_Vendedor_CTS,
+  UR_Vendedor_Estado_CTS,
+  ER_Vendedor_CTS
+} from '../Controllers/Vendedores/CTS_TB_Vendedores.js';
+
+import {
+  OBRS_VB_CTS,
+  OBRS_VB_PorVendedor_CTS,
+  CR_VB_Asigna_CTS,
+  UR_VB_Cerrar_CTS,
+  UR_VB_Estado_CTS,
+  ER_VB_CTS
+} from '../Controllers/Vendedores/CTS_TB_VendedorBarrios.js';
+// Importar controladores de vendedores fin
+
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
 // ----------------------------------------------------------------
@@ -93,7 +113,6 @@ router.delete('/locales/:id', ER_Local_CTS);
 
 // Actualizar un local por ID
 router.put('/locales/:id', UR_Local_CTS);
-
 
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'usuarios'
@@ -155,4 +174,28 @@ router.post('/geo/barrios', CR_Barrio_CTS);
 router.put('/geo/barrios/:id', UR_Barrio_CTS);
 router.patch('/geo/barrios/:id/estado', PR_Barrio_Estado_CTS);
 router.delete('/geo/barrios/:id', ER_Barrio_CTS);
+
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'vendedores'
+// ----------------------------------------------------------------
+router.get('/vendedores', OBRS_Vendedores_CTS);
+router.get('/vendedores/:id', OBR_Vendedor_CTS);
+router.post('/vendedores', CR_Vendedor_CTS);
+router.put('/vendedores/:id', UR_Vendedor_CTS);
+router.patch('/vendedores/:id/estado', UR_Vendedor_Estado_CTS);
+router.delete('/vendedores/:id', ER_Vendedor_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'vendedores_barrios'
+// ----------------------------------------------------------------
+// Global
+router.get('/vendedor_barrios', OBRS_VB_CTS);
+
+// Por vendedor
+router.get('/vendedores/:id/barrios', OBRS_VB_PorVendedor_CTS);
+router.post('/vendedores/:id/barrios', CR_VB_Asigna_CTS); // body: { barrio_id, asignado_desde?, asignado_hasta?, estado?, autoClose? }
+router.patch('/vendedores/:id/barrios/:asigId/cerrar', UR_VB_Cerrar_CTS); // body: { hasta? }
+router.patch('/vendedores/:id/barrios/:asigId/estado', UR_VB_Estado_CTS);  // body: { estado }
+router.delete('/vendedores/:id/barrios/:asigId', ER_VB_CTS);               // ?hard=1 para borrar vigente
 export default router;
