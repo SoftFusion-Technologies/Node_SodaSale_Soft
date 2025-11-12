@@ -209,6 +209,187 @@ export const CR_Localidad_CTS = async (req, res) => {
   }
 };
 
+// ===============================
+// BULK: POST /geo/localidades/bulk
+// Body:
+// {
+//   "ciudad_id": 12,
+//   "items": ["Centro", "Norte", {"nombre":"Sur","estado":"inactiva"}],
+//   "dryRun": false   // opcional: true = simula sin insertar
+// }
+// ===============================
+export const CR_Bulk_Localidades_CTS = async (req, res) => {
+  const t = await LocalidadesModel.sequelize.transaction();
+  try {
+    const { ciudad_id, items, dryRun = false } = req.body || {};
+
+    // ---- Validaciones de payload
+    const cid = toInt(ciudad_id, 0);
+    if (!cid) {
+      await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'ciudad_id es obligatorio y debe ser numérico'
+      });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'items debe ser un array con al menos 1 elemento'
+      });
+    }
+    if (items.length > 1000) {
+      await t.rollback();
+      return res.status(413).json({
+        code: 'PAYLOAD_TOO_LARGE',
+        mensajeError: 'Máximo 1000 localidades por bulk'
+      });
+    }
+
+    // ---- Verificar existencia de la ciudad
+    const ciudad = await CiudadesModel.findByPk(cid, { transaction: t });
+    if (!ciudad) {
+      await t.rollback();
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'La ciudad indicada no existe'
+      });
+    }
+
+    // ---- Helpers locales
+    const normalizeNombre = (s) =>
+      String(s || '')
+        .normalize('NFD')
+        .replace(/\p{Diacritic}/gu, '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+
+    // Normalizar items de entrada a objetos { nombre, estado }
+    const entrada = items
+      .map((it) =>
+        typeof it === 'string'
+          ? { nombre: it, estado: 'activa' }
+          : { nombre: it?.nombre, estado: it?.estado || 'activa' }
+      )
+      .filter((x) => x?.nombre && String(x.nombre).trim() !== '');
+
+    if (entrada.length === 0) {
+      await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError:
+          'No hay localidades válidas en items (verificá los nombres)'
+      });
+    }
+
+    // ---- Buscar existentes en la ciudad (para evitar duplicados)
+    const existentes = await LocalidadesModel.findAll({
+      where: { ciudad_id: cid },
+      attributes: ['id', 'nombre'],
+      transaction: t
+    });
+
+    const setExistentes = new Set(
+      existentes.map((r) => normalizeNombre(r.nombre))
+    );
+
+    // ---- Filtrar duplicados internos y ya existentes
+    const vistos = new Set();
+    const aCrear = [];
+    const omitidas = []; // { nombre, motivo }
+
+    for (const it of entrada) {
+      const nomNorm = normalizeNombre(it.nombre);
+
+      if (vistos.has(nomNorm)) {
+        omitidas.push({
+          nombre: it.nombre,
+          motivo: 'Duplicado en el payload'
+        });
+        continue;
+      }
+      vistos.add(nomNorm);
+
+      if (setExistentes.has(nomNorm)) {
+        omitidas.push({
+          nombre: it.nombre,
+          motivo: 'Ya existe en la ciudad (UNIQUE ciudad_id + nombre)'
+        });
+        continue;
+      }
+
+      aCrear.push({
+        ciudad_id: cid,
+        nombre: it.nombre.trim().replace(/\s+/g, ' '),
+        estado: it.estado === 'inactiva' ? 'inactiva' : 'activa'
+      });
+    }
+
+    // ---- Si es dryRun solo devolvemos el preview
+    if (dryRun) {
+      await t.rollback();
+      return res.json({
+        message: 'Preview de bulk (dryRun=true)',
+        meta: {
+          ciudad_id: cid,
+          solicitadas: items.length,
+          validas: entrada.length,
+          aCrear: aCrear.length,
+          omitidas: omitidas.length
+        },
+        crear: aCrear,
+        omitidas
+      });
+    }
+
+    // ---- Insertar en bloque (con protección ante carrera)
+    // ignoreDuplicates funciona en MySQL/MariaDB; si usás otro motor, podés
+    // removerlo y manejar la excepción de UNIQUE manualmente.
+    const creadas = await LocalidadesModel.bulkCreate(aCrear, {
+      transaction: t,
+      ignoreDuplicates: true
+    });
+
+    await t.commit();
+
+    return res.status(201).json({
+      message: 'Bulk de localidades procesado',
+      meta: {
+        ciudad_id: cid,
+        solicitadas: items.length,
+        validas: entrada.length,
+        creadas: creadas.length,
+        omitidas: omitidas.length
+      },
+      creadas,
+      omitidas
+    });
+  } catch (error) {
+    await t.rollback();
+    console.error('CR_Bulk_Localidades_CTS error:', error);
+
+    if (error?.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({
+        code: 'DUPLICATE',
+        mensajeError:
+          'Conflicto de UNIQUE en una o más localidades (ciudad_id, nombre)',
+        tips: [
+          'Ejecutá primero con dryRun=true para ver cuáles existen',
+          'Revisá espacios/acentos y nombres repetidos'
+        ]
+      });
+    }
+
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo procesar el bulk de localidades'
+    });
+  }
+};
+
 /* ==========================================
    PUT /geo/localidades/:id  → actualizar
    Body permitido: { ciudad_id?, nombre?, estado? }

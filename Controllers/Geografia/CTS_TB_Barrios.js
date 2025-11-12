@@ -233,6 +233,180 @@ export const CR_Barrio_CTS = async (req, res) => {
   }
 };
 
+// ===============================
+// BULK: POST /geo/barrios/bulk
+// Body:
+// {
+//   "localidad_id": 34,
+//   "items": ["San Martín", {"nombre":"Belgrano","estado":"inactiva"}],
+//   "dryRun": false
+// }
+// (Opcional) variante RESTful:
+// POST /geo/localidades/:localidad_id/barrios/bulk  (mismo handler)
+// ===============================
+export const CR_Bulk_Barrios_CTS = async (req, res) => {
+  const t = await BarriosModel.sequelize.transaction();
+  try {
+    const pathLocalidad = toInt(req.params?.localidad_id, 0);
+    const { localidad_id, items, dryRun = false } = req.body || {};
+    const lid = pathLocalidad || toInt(localidad_id, 0);
+
+    // ---- Validaciones de payload
+    if (!lid) {
+      await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'localidad_id es obligatorio y debe ser numérico'
+      });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'items debe ser un array con al menos 1 elemento'
+      });
+    }
+    if (items.length > 1000) {
+      await t.rollback();
+      return res.status(413).json({
+        code: 'PAYLOAD_TOO_LARGE',
+        mensajeError: 'Máximo 1000 barrios por bulk'
+      });
+    }
+
+    // ---- Verificar existencia de la localidad
+    const loc = await LocalidadesModel.findByPk(lid, { transaction: t });
+    if (!loc) {
+      await t.rollback();
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'La localidad indicada no existe'
+      });
+    }
+
+    // ---- Helpers
+    const normalizeNombre = (s) =>
+      String(s || '')
+        .normalize('NFD')
+        .replace(/\p{Diacritic}/gu, '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+
+    const entrada = items
+      .map((it) =>
+        typeof it === 'string'
+          ? { nombre: it, estado: 'activa' }
+          : { nombre: it?.nombre, estado: it?.estado || 'activa' }
+      )
+      .filter((x) => x?.nombre && String(x.nombre).trim() !== '');
+
+    if (entrada.length === 0) {
+      await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError:
+          'No hay barrios válidos en items (verificá los nombres)'
+      });
+    }
+
+    // ---- Buscar existentes (para evitar duplicados por UNIQUE local+nombre)
+    const existentes = await BarriosModel.findAll({
+      where: { localidad_id: lid },
+      attributes: ['id', 'nombre'],
+      transaction: t
+    });
+    const setExistentes = new Set(
+      existentes.map((r) => normalizeNombre(r.nombre))
+    );
+
+    // ---- Filtrar duplicados internos y existentes
+    const vistos = new Set();
+    const aCrear = [];
+    const omitidas = []; // { nombre, motivo }
+
+    for (const it of entrada) {
+      const nomNorm = normalizeNombre(it.nombre);
+
+      if (vistos.has(nomNorm)) {
+        omitidas.push({ nombre: it.nombre, motivo: 'Duplicado en el payload' });
+        continue;
+      }
+      vistos.add(nomNorm);
+
+      if (setExistentes.has(nomNorm)) {
+        omitidas.push({
+          nombre: it.nombre,
+          motivo: 'Ya existe en la localidad (UNIQUE localidad_id + nombre)'
+        });
+        continue;
+      }
+
+      aCrear.push({
+        localidad_id: lid,
+        nombre: it.nombre.trim().replace(/\s+/g, ' '),
+        estado: it.estado === 'inactiva' ? 'inactiva' : 'activa'
+      });
+    }
+
+    // ---- Dry run → solo preview
+    if (dryRun) {
+      await t.rollback();
+      return res.json({
+        message: 'Preview de bulk (dryRun=true)',
+        meta: {
+          localidad_id: lid,
+          solicitadas: items.length,
+          validas: entrada.length,
+          aCrear: aCrear.length,
+          omitidas: omitidas.length
+        },
+        crear: aCrear,
+        omitidas
+      });
+    }
+
+    // ---- Insertar en bloque (MySQL/MariaDB: ignoreDuplicates)
+    const creadas = await BarriosModel.bulkCreate(aCrear, {
+      transaction: t,
+      ignoreDuplicates: true
+    });
+
+    await t.commit();
+    return res.status(201).json({
+      message: 'Bulk de barrios procesado',
+      meta: {
+        localidad_id: lid,
+        solicitadas: items.length,
+        validas: entrada.length,
+        creadas: creadas.length,
+        omitidas: omitidas.length
+      },
+      creadas,
+      omitidas
+    });
+  } catch (error) {
+    await t.rollback();
+    console.error('CR_Bulk_Barrios_CTS error:', error);
+
+    if (error?.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({
+        code: 'DUPLICATE',
+        mensajeError:
+          'Conflicto de UNIQUE en uno o más barrios (localidad_id, nombre)',
+        tips: [
+          'Ejecutá primero con dryRun=true para ver cuáles existen',
+          'Revisá espacios/acentos y nombres repetidos'
+        ]
+      });
+    }
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo procesar el bulk de barrios'
+    });
+  }
+};
+
 /* ==========================================
    PUT /geo/barrios/:id → actualizar
    Body permitido: { localidad_id?, nombre?, estado? }

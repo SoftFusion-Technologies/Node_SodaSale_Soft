@@ -59,6 +59,7 @@ import {
   OBRS_Localidades_CTS,
   OBR_Localidad_CTS,
   CR_Localidad_CTS,
+  CR_Bulk_Localidades_CTS,
   UR_Localidad_CTS,
   PR_Localidad_Estado_CTS,
   ER_Localidad_CTS
@@ -68,11 +69,11 @@ import {
   OBRS_Barrios_CTS,
   OBR_Barrio_CTS,
   CR_Barrio_CTS,
+  CR_Bulk_Barrios_CTS,
   UR_Barrio_CTS,
   PR_Barrio_Estado_CTS,
   ER_Barrio_CTS
 } from '../Controllers/Geografia/CTS_TB_Barrios.js';
-
 // Importar controladores de geografia fin
 
 // Importar controladores de vendedores inicio
@@ -162,6 +163,7 @@ router.delete('/geo/ciudades/:id', ER_Ciudad_CTS);
 router.get('/geo/localidades', OBRS_Localidades_CTS);
 router.get('/geo/localidades/:id', OBR_Localidad_CTS);
 router.post('/geo/localidades', CR_Localidad_CTS);
+router.post('/geo/localidades/bulk', CR_Bulk_Localidades_CTS);
 router.put('/geo/localidades/:id', UR_Localidad_CTS);
 router.patch('/geo/localidades/:id/estado', PR_Localidad_Estado_CTS);
 router.delete('/geo/localidades/:id', ER_Localidad_CTS);
@@ -172,6 +174,7 @@ router.delete('/geo/localidades/:id', ER_Localidad_CTS);
 router.get('/geo/barrios', OBRS_Barrios_CTS);
 router.get('/geo/barrios/:id', OBR_Barrio_CTS);
 router.post('/geo/barrios', CR_Barrio_CTS);
+router.post('/geo/barrios/bulk', CR_Bulk_Barrios_CTS);
 router.put('/geo/barrios/:id', UR_Barrio_CTS);
 router.patch('/geo/barrios/:id/estado', PR_Barrio_Estado_CTS);
 router.delete('/geo/barrios/:id', ER_Barrio_CTS);
