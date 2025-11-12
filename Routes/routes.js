@@ -89,6 +89,7 @@ import {
   OBRS_VB_CTS,
   OBRS_VB_PorVendedor_CTS,
   CR_VB_Asigna_CTS,
+  CR_VB_BulkAsignar_CTS,
   UR_VB_Cerrar_CTS,
   UR_VB_Estado_CTS,
   ER_VB_CTS
@@ -175,7 +176,6 @@ router.put('/geo/barrios/:id', UR_Barrio_CTS);
 router.patch('/geo/barrios/:id/estado', PR_Barrio_Estado_CTS);
 router.delete('/geo/barrios/:id', ER_Barrio_CTS);
 
-
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'vendedores'
 // ----------------------------------------------------------------
@@ -195,7 +195,8 @@ router.get('/vendedor_barrios', OBRS_VB_CTS);
 // Por vendedor
 router.get('/vendedores/:id/barrios', OBRS_VB_PorVendedor_CTS);
 router.post('/vendedores/:id/barrios', CR_VB_Asigna_CTS); // body: { barrio_id, asignado_desde?, asignado_hasta?, estado?, autoClose? }
+router.post('/vendedor_barrios/bulk', CR_VB_BulkAsignar_CTS);
 router.patch('/vendedores/:id/barrios/:asigId/cerrar', UR_VB_Cerrar_CTS); // body: { hasta? }
-router.patch('/vendedores/:id/barrios/:asigId/estado', UR_VB_Estado_CTS);  // body: { estado }
-router.delete('/vendedores/:id/barrios/:asigId', ER_VB_CTS);               // ?hard=1 para borrar vigente
+router.patch('/vendedores/:id/barrios/:asigId/estado', UR_VB_Estado_CTS); // body: { estado }
+router.delete('/vendedores/:id/barrios/:asigId', ER_VB_CTS); // ?hard=1 para borrar vigente
 export default router;

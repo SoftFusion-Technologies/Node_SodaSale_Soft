@@ -32,7 +32,7 @@ import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
 import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 
 // ---------- includes de geografía (para joins lindos)
-const incGeo = [
+const incGeo = () => [
   {
     model: BarriosModel,
     as: 'barrio',
@@ -387,6 +387,171 @@ export const CR_VB_Asigna_CTS = async (req, res) => {
   }
 };
 
+const normIdList = (arr) =>
+  Array.from(
+    new Set(
+      (Array.isArray(arr) ? arr : [])
+        .map((x) => Number(x))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    )
+  );
+
+export const CR_VB_BulkAsignar_CTS = async (req, res) => {
+  const t = await db.transaction();
+  try {
+    const {
+      vendedor_ids,
+      barrio_ids,
+      barrio_id,
+      asignado_desde,
+      asignado_hasta,
+      estado
+    } = req.body || {};
+
+    const vendIds = normIdList(vendedor_ids);
+    const barrIds = normIdList(barrio_ids || (barrio_id ? [barrio_id] : []));
+
+    if (vendIds.length === 0 || barrIds.length === 0) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError:
+          'Debés enviar al menos un vendedor en vendedor_ids y al menos un barrio en barrio_ids/barrio_id.'
+      });
+    }
+
+    // Validar existencia
+    const [vends, barrs] = await Promise.all([
+      VendedoresModel.findAll({
+        where: { id: { [Op.in]: vendIds } },
+        transaction: t
+      }),
+      BarriosModel.findAll({
+        where: { id: { [Op.in]: barrIds } },
+        transaction: t
+      })
+    ]);
+
+    const validVend = new Set(vends.map((v) => v.id));
+    const validBarr = new Set(barrs.map((b) => b.id));
+
+    const invalidVendorIds = vendIds.filter((id) => !validVend.has(id));
+    const invalidBarrioIds = barrIds.filter((id) => !validBarr.has(id));
+    if (invalidBarrioIds.length > 0) {
+      if (!t.finished) await t.rollback();
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Hay barrios inexistentes en la solicitud.',
+        details: { invalidBarrioIds }
+      });
+    }
+    // Si hay vendedores inválidos, seguimos pero los reportamos
+    // (útil cuando marcaste 10 y uno fue eliminado mientras tanto)
+
+    // Reglas de fecha (mismo criterio que el CREATE simple)
+    const ahora = new Date();
+    const desde = parseDateFlexible(asignado_desde) || ahora;
+    const hastaParsed = parseDateFlexible(asignado_hasta);
+    const hasta = hastaParsed && hastaParsed <= ahora ? hastaParsed : null;
+    const estadoFinal = ['activo', 'inactivo'].includes(String(estado))
+      ? estado
+      : 'activo';
+
+    // Pre-carga: qué pares ya tienen vigente para evitar colisión
+    const existing = await VendedorBarrioModel.findAll({
+      where: {
+        vendedor_id: { [Op.in]: vendIds },
+        barrio_id: { [Op.in]: barrIds },
+        asignado_hasta: { [Op.is]: null }
+      },
+      transaction: t
+    });
+    const existingSet = new Set(
+      existing.map((r) => `${r.vendedor_id}:${r.barrio_id}`)
+    );
+
+    const pairs = [];
+    for (const vid of vendIds) {
+      if (!validVend.has(vid)) continue;
+      for (const bid of barrIds) {
+        if (!validBarr.has(bid)) continue;
+        pairs.push({ vid, bid });
+      }
+    }
+
+    const insertedIds = [];
+    const skipped = []; // {vendedor_id,barrio_id,reason}
+
+    // Inserciones una por una para tolerar conflictos sin abortar todo
+    for (const { vid, bid } of pairs) {
+      const key = `${vid}:${bid}`;
+      if (existingSet.has(key)) {
+        skipped.push({
+          vendedor_id: vid,
+          barrio_id: bid,
+          reason: 'ALREADY_VIGENTE'
+        });
+        continue;
+      }
+      try {
+        const row = await VendedorBarrioModel.create(
+          {
+            vendedor_id: vid,
+            barrio_id: bid,
+            asignado_desde: desde,
+            asignado_hasta: hasta,
+            estado: estadoFinal
+          },
+          { transaction: t }
+        );
+        insertedIds.push(row.id);
+      } catch (e) {
+        // Si por carrera de concurrencia saltó unique, lo marcamos como skip
+        if (e?.name === 'SequelizeUniqueConstraintError') {
+          skipped.push({
+            vendedor_id: vid,
+            barrio_id: bid,
+            reason: 'ALREADY_VIGENTE_DB'
+          });
+          continue;
+        }
+        // Otro error duro: abortar todo
+        throw e;
+      }
+    }
+
+    await t.commit();
+
+    // Enriquecer fuera de la tx
+    const inserted = insertedIds.length
+      ? await VendedorBarrioModel.findAll({
+          where: { id: { [Op.in]: insertedIds } },
+          include: incGeo()
+        })
+      : [];
+
+    return res.status(201).json({
+      summary: {
+        requested: pairs.length,
+        inserted: inserted.length,
+        skipped: skipped.length,
+        invalidVendorIds
+      },
+      inserted,
+      skipped
+    });
+  } catch (error) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+    console.error('CR_VB_BulkAsignar_CTS error:', error);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudieron crear asignaciones masivas.'
+    });
+  }
+};
+
 // =====================================================
 // CERRAR ASIGNACIÓN (PATCH /vendedores/:id/barrios/:asigId/cerrar)
 // body: { hasta }  (si no viene, usa now)
@@ -532,6 +697,7 @@ export default {
   OBRS_VB_CTS,
   OBRS_VB_PorVendedor_CTS,
   CR_VB_Asigna_CTS,
+  CR_VB_BulkAsignar_CTS,
   UR_VB_Cerrar_CTS,
   UR_VB_Estado_CTS,
   ER_VB_CTS
