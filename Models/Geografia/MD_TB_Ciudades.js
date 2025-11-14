@@ -14,7 +14,6 @@
 import dotenv from 'dotenv';
 import db from '../../DataBase/db.js';
 import { DataTypes } from 'sequelize';
-import { LocalidadesModel } from './MD_TB_Localidades.js';
 if (process.env.NODE_ENV !== 'production') {
   dotenv.config();
 }

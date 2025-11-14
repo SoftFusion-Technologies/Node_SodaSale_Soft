@@ -32,9 +32,10 @@ if (process.env.NODE_ENV !== 'production') {
 }
 import './Models/Geografia/relacionesGeografia.js';
 import initVendedoresRelations from './Models/Vendedores/relacionesVendedores.js';
+import initRelacionesVentasCxC from './Models/relacionesVentasCxC.js';
 
-// …luego de importar/registrar TODOS los modelos:
 initVendedoresRelations();
+initRelacionesVentasCxC()
 // const PORT = process.env.PORT || 3000;
 
 // console.log(process.env.PORT)
@@ -74,10 +75,7 @@ app.use(timeRouter); // <-- NUEVO
 
 app.use(
   timeGuard([
-    '/ventas', // ej: POST /ventas, GET
-    '/caja',
-    '/movimientos', // si tenés endpoints de caja/movimientos
-    '/stock' // operaciones de stock
+    '/ventas' // ej: POST /ventas, GET
   ])
 );
 app.use('/', GetRoutes);
@@ -142,8 +140,6 @@ app.use(
     }
   })
 );
-
-
 
 if (!PORT) {
   console.error('El puerto no está definido en el archivo de configuración.');

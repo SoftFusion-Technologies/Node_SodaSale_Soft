@@ -97,6 +97,37 @@ import {
 } from '../Controllers/Vendedores/CTS_TB_VendedorBarrios.js';
 // Importar controladores de vendedores fin
 
+// Importar controladores de clientes inicio
+import {
+  OBRS_Clientes_CTS, // GET    /clientes
+  OBR_Cliente_CTS, // GET    /clientes/:id
+  CR_Cliente_CTS, // POST   /clientes
+  UR_Cliente_CTS, // PUT    /clientes/:id
+  UR_Cliente_Estado_CTS, // PATCH  /clientes/:id/estado
+  ER_Cliente_CTS // DELETE /clientes/:id?hard=1
+} from '../Controllers/Clientes/CTS_TB_Clientes.js';
+// Importar controladores de clientes fin
+
+// Importar controladores de ventas inicio
+import {
+  OBRS_Ventas_CTS,
+  OBR_Venta_CTS,
+  CR_Venta_CTS,
+  UR_Venta_CTS,
+  UR_Venta_Anular_CTS,
+  ER_Venta_CTS,
+  UR_Venta_RecalcularTotal_CTS
+} from '../Controllers/Ventas/CTS_TB_Ventas.js';
+
+import {
+  OBRS_VentasItems_CTS,
+  CR_VentasItems_CTS,
+  UR_VentasItem_CTS,
+  ER_VentasItem_CTS,
+  RP_VentasItems_CTS,
+} from '../Controllers/Ventas/CTS_TB_VentasDetalle.js';
+// Importar controladores de ventas fin
+
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
 // ----------------------------------------------------------------
@@ -202,4 +233,46 @@ router.post('/vendedor_barrios/bulk', CR_VB_BulkAsignar_CTS);
 router.patch('/vendedores/:id/barrios/:asigId/cerrar', UR_VB_Cerrar_CTS); // body: { hasta? }
 router.patch('/vendedores/:id/barrios/:asigId/estado', UR_VB_Estado_CTS); // body: { estado }
 router.delete('/vendedores/:id/barrios/:asigId', ER_VB_CTS); // ?hard=1 para borrar vigente
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'clientes'
+// ----------------------------------------------------------------
+// Listado con filtros/paginación
+router.get('/clientes', OBRS_Clientes_CTS);
+
+// Detalle por ID (incluye geografía)
+router.get('/clientes/:id', OBR_Cliente_CTS);
+
+// Crear cliente
+router.post('/clientes', CR_Cliente_CTS);
+
+// Actualizar cliente
+router.put('/clientes/:id', UR_Cliente_CTS);
+
+// Cambiar estado (activo/inactivo)
+router.patch('/clientes/:id/estado', UR_Cliente_Estado_CTS);
+
+// Eliminar (soft por defecto, hard con ?hard=1)
+router.delete('/clientes/:id', ER_Cliente_CTS);
+
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'clientes'
+// ----------------------------------------------------------------
+router.get('/ventas', OBRS_Ventas_CTS);
+router.get('/ventas/:id', OBR_Venta_CTS);
+router.post('/ventas', CR_Venta_CTS);
+router.put('/ventas/:id', UR_Venta_CTS);
+router.patch('/ventas/:id/anular', UR_Venta_Anular_CTS);
+router.delete('/ventas/:id', ER_Venta_CTS);
+router.post('/ventas/:ventaId/recalcular', UR_Venta_RecalcularTotal_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'clientes'
+// ----------------------------------------------------------------
+router.get('/ventas/:ventaId/items', OBRS_VentasItems_CTS);
+router.post('/ventas/:ventaId/items', CR_VentasItems_CTS); // 1 o n ítems
+router.put('/ventas/:ventaId/items/:itemId', UR_VentasItem_CTS);
+router.delete('/ventas/:ventaId/items/:itemId', ER_VentasItem_CTS);
+router.post('/ventas/:ventaId/items/replace', RP_VentasItems_CTS); // reemplazo total
 export default router;
