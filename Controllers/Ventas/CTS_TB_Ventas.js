@@ -205,48 +205,36 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       hasta,
       include,
       orderBy = 'fecha',
-      orderDir = 'DESC'
+      orderDir = 'DESC',
+      // 👇 nuevos filtros de geografía
+      ciudad_id,
+      localidad_id,
+      barrio_id
     } = req.query;
 
     const where = {};
-
-    // cliente_id / vendedor_id solo si son numéricos válidos
-    const cid = normInt(cliente_id);
-    if (Number.isFinite(cid)) where.cliente_id = cid;
-
-    const vid = normInt(vendedor_id);
-    if (Number.isFinite(vid)) where.vendedor_id = vid;
-
-    // tipo solo si es uno permitido
-    if (tipo && ['contado', 'fiado', 'a_cuenta'].includes(String(tipo))) {
-      where.tipo = String(tipo);
-    }
-
-    if (estado && ['confirmada', 'anulada'].includes(String(estado))) {
+    if (cliente_id) where.cliente_id = Number(cliente_id);
+    if (vendedor_id) where.vendedor_id = Number(vendedor_id);
+    if (tipo) where.tipo = coerceTipo(tipo);
+    if (estado && ['confirmada', 'anulada'].includes(String(estado)))
       where.estado = String(estado);
-    }
 
-    // Rango de fechas (con sanity check)
-    let d = null;
-    let h = null;
-    if (desde) {
-      const tmp = new Date(`${desde}T00:00:00`);
-      if (!isNaN(tmp.getTime())) d = tmp;
-    }
-    if (hasta) {
-      const tmp = new Date(`${hasta}T23:59:59`);
-      if (!isNaN(tmp.getTime())) h = tmp;
-    }
-    if (d || h) {
+    if (desde || hasta) {
+      const d = desde ? new Date(`${desde}T00:00:00`) : null;
+      const h = hasta ? new Date(`${hasta}T23:59:59`) : null;
       where.fecha =
         d && h
           ? { [Op.between]: [d, h] }
           : d
           ? { [Op.gte]: d }
-          : { [Op.lte]: h };
+          : h
+          ? { [Op.lte]: h }
+          : undefined;
     }
 
     const and = [];
+
+    // 🔍 búsqueda por texto en cliente
     if (q && q.trim()) {
       const like = `%${q.trim()}%`;
       and.push({
@@ -258,7 +246,25 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       });
     }
 
-    const finalWhere = and.length ? { [Op.and]: [where, ...and] } : where;
+    if (barrio_id) {
+      and.push({
+        '$cliente.barrio.id$': Number(barrio_id)
+      });
+    }
+    if (localidad_id) {
+      and.push({
+        '$cliente.barrio.localidad.id$': Number(localidad_id)
+      });
+    }
+    if (ciudad_id) {
+      and.push({
+        '$cliente.barrio.localidad.ciudad.id$': Number(ciudad_id)
+      });
+    }
+
+    const finalWhere =
+      and.length > 0 ? { [Op.and]: [where, ...and] } : where;
+
     const [col, dir] = safeOrder(orderBy, orderDir);
 
     const baseInc = [incClienteGeo, incVendedor];
@@ -287,12 +293,12 @@ export const OBRS_Ventas_CTS = async (req, res) => {
     });
   } catch (err) {
     console.error('OBRS_Ventas_CTS error:', err);
-    return res.status(500).json({
-      code: 'SERVER_ERROR',
-      mensajeError: 'Error listando ventas.'
-    });
+    return res
+      .status(500)
+      .json({ code: 'SERVER_ERROR', mensajeError: 'Error listando ventas.' });
   }
 };
+
 
 // ===============================
 // GET ONE - GET /ventas/:id  (incluye items)
