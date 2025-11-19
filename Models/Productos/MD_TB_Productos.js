@@ -1,12 +1,13 @@
 /*
  * Programador: Benjamin Orellana
  * Fecha Creación: 10 / 11 / 2025
- * Versión: 1.0
+ * Versión: 1.1
  *
  * Descripción:
  * Modelo Sequelize para la tabla 'productos'.
  * Incluye validaciones de coherencia (presentación vs pack, rango de IVA) e índices.
  *
+ * VERSION 1.1 = SE ADICIONA COLUMNA PRECIO PRODUCTO (pre_prod) A LA TABLA PRODUCTOS
  * Tema: Modelos - Productos
  * Capa: Backend
  */
@@ -80,6 +81,13 @@ export const ProductosModel = db.define(
         is: { args: /^[0-9]+$/i, msg: 'El EAN debe ser numérico' }
       }
     },
+    // Benjamin Orellana - 18/11/2025 - Se adiciona columna precio producto INICIO
+    pre_prod: {
+      type: DataTypes.DECIMAL(18, 2),
+      allowNull: false,
+      defaultValue: 0.0
+    },
+    // Benjamin Orellana - 18/11/2025 - Se adiciona columna precio producto FINAL
     iva_porcentaje: {
       type: DataTypes.DECIMAL(5, 2),
       allowNull: false,

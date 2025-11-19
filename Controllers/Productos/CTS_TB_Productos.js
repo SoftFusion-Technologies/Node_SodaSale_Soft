@@ -209,6 +209,7 @@ export const CR_Producto_CTS = async (req, res) => {
       'unidad_medida',
       'contenido',
       'barra_ean13',
+      'pre_prod',
       'iva_porcentaje',
       'estado',
       'notas'
@@ -255,6 +256,7 @@ export const UR_Producto_CTS = async (req, res) => {
       'unidad_medida',
       'contenido',
       'barra_ean13',
+      'pre_prod',
       'iva_porcentaje',
       'estado',
       'notas'
