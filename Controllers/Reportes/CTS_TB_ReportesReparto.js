@@ -674,8 +674,8 @@ function buildReporteRepartoCobranzaHtml(data) {
     margin: 0;
     font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     font-size: 11px;
-    color: #e5e7eb;
-    background: radial-gradient(circle at top, #020617 0, #020617 40%, #020617 100%);
+    color: #111827; /* slate-900 */
+    background: #ffffff; /* fondo blanco para impresión */
   }
   .wrapper {
     padding: 10mm 4mm 12mm 4mm;
@@ -686,7 +686,7 @@ function buildReporteRepartoCobranzaHtml(data) {
     align-items: flex-start;
     margin-bottom: 12px;
     padding-bottom: 8px;
-    border-bottom: 1px solid rgba(251, 191, 36, 0.4);
+    border-bottom: 1px solid #e5e7eb; /* gris claro */
   }
   .logo-titulo {
     max-width: 65%;
@@ -695,29 +695,29 @@ function buildReporteRepartoCobranzaHtml(data) {
     font-size: 9px;
     letter-spacing: 0.18em;
     text-transform: uppercase;
-    color: rgba(248, 250, 252, 0.7);
+    color: #6b7280; /* gris medio */
   }
   h1 {
     margin: 2px 0 3px 0;
     font-size: 20px;
-    color: #facc15;
+    color: #b45309; /* ámbar oscuro solo en texto */
   }
   .subtitle {
     font-size: 10px;
-    color: rgba(248, 250, 252, 0.7);
+    color: #4b5563;
   }
   .meta {
     text-align: right;
     font-size: 9px;
-    color: rgba(248, 250, 252, 0.75);
+    color: #4b5563;
   }
   .meta strong {
-    color: #fef3c7;
+    color: #111827;
   }
   .filtros-box {
     margin-top: 4px;
     font-size: 9px;
-    color: rgba(248, 250, 252, 0.7);
+    color: #4b5563;
   }
 
   .kpis {
@@ -727,35 +727,35 @@ function buildReporteRepartoCobranzaHtml(data) {
     margin-bottom: 10px;
   }
   .kpi-card {
-    background: radial-gradient(circle at top left,#0f172a,#020617);
+    background: #f9fafb; /* gris muy claro */
     border-radius: 10px;
-    border: 1px solid rgba(148,163,184,0.7);
+    border: 1px solid #e5e7eb;
     padding: 6px 8px;
   }
   .kpi-label {
     font-size: 9px;
     letter-spacing: 0.16em;
     text-transform: uppercase;
-    color: rgba(248,250,252,0.7);
+    color: #6b7280;
   }
   .kpi-value {
     margin-top: 2px;
     font-size: 15px;
     font-weight: 600;
-    color: #fef9c3;
+    color: #111827;
   }
 
   .clientes-section-title {
     margin: 10px 0 4px 0;
     font-size: 11px;
     font-weight: 600;
-    color: #fef3c7;
+    color: #111827;
   }
 
   .card-cliente {
-    background: linear-gradient(135deg, rgba(15,23,42,0.96), rgba(15,23,42,0.9));
+    background: #ffffff;
     border-radius: 14px;
-    border: 1px solid rgba(148,163,184,0.7);
+    border: 1px solid #e5e7eb;
     padding: 8px 9px;
     margin-bottom: 6px;
     page-break-inside: avoid;
@@ -771,24 +771,24 @@ function buildReporteRepartoCobranzaHtml(data) {
     width: 22px;
     height: 22px;
     border-radius: 10px;
-    background: rgba(250,204,21,0.16);
-    border: 1px solid rgba(250,204,21,0.7);
+    background: #fef3c7;          /* amarillo muy suave */
+    border: 1px solid #f59e0b;    /* ámbar */
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: 11px;
     font-weight: 600;
-    color: #fef9c3;
+    color: #92400e;
   }
   .cliente-datos { flex: 1 1 auto; }
   .cliente-nombre {
     font-size: 11px;
     font-weight: 600;
-    color: #fef9c3;
+    color: #111827;
   }
   .cliente-doc, .cliente-contacto {
     font-size: 9px;
-    color: rgba(248,250,252,0.7);
+    color: #4b5563;
   }
   .cliente-deuda {
     min-width: 130px;
@@ -798,17 +798,17 @@ function buildReporteRepartoCobranzaHtml(data) {
     font-size: 8px;
     letter-spacing: .16em;
     text-transform: uppercase;
-    color: rgba(110,231,183,0.8);
+    color: #047857; /* verde texto */
   }
   .deuda-importe {
     margin-top: 1px;
     font-size: 13px;
     font-weight: 600;
-    color: #bbf7d0;
+    color: #047857;
   }
   .deuda-resumen {
     font-size: 9px;
-    color: rgba(248,250,252,0.7);
+    color: #4b5563;
   }
 
   .card-body {
@@ -822,7 +822,7 @@ function buildReporteRepartoCobranzaHtml(data) {
   }
   .card-body .col:last-child {
     padding-left: 10px;
-    border-left: 1px dashed rgba(148,163,184,0.45);
+    border-left: 1px dashed #e5e7eb;
   }
 
   .tabla-ventas {
@@ -836,21 +836,21 @@ function buildReporteRepartoCobranzaHtml(data) {
     font-size: 8.5px;
   }
   .tabla-ventas thead {
-    background: rgba(15,23,42,0.9);
+    background: #f3f4f6; /* gris muy claro, no negro */
   }
   .tabla-ventas th {
     text-align: left;
-    color: rgba(248,250,252,0.8);
-    border-bottom: 1px solid rgba(148,163,184,0.6);
+    color: #374151;
+    border-bottom: 1px solid #d1d5db;
   }
   .tabla-ventas td {
-    border-bottom: 1px solid rgba(30,41,59,0.7);
+    border-bottom: 1px solid #e5e7eb;
   }
   .text-right { text-align: right; }
 
   .text-body {
     font-size: 9px;
-    color: rgba(248,250,252,0.8);
+    color: #4b5563;
   }
 
   /* Planeo de reparto */
@@ -860,7 +860,7 @@ function buildReporteRepartoCobranzaHtml(data) {
   }
   .planeo-ayuda {
     font-size: 8px;
-    color: rgba(148,163,184,0.95);
+    color: #6b7280;
     margin-bottom: 3px;
   }
   .planeo-subtitle-sec {
@@ -872,10 +872,10 @@ function buildReporteRepartoCobranzaHtml(data) {
   }
   .planeo-producto {
     border-radius: 8px;
-    border: 1px solid rgba(148,163,184,0.8);
+    border: 1px solid #e5e7eb;
     padding: 3px 5px;
     margin-bottom: 3px;
-    background: rgba(15,23,42,0.85);
+    background: #f9fafb;
   }
   .planeo-producto-main {
     display: flex;
@@ -886,16 +886,16 @@ function buildReporteRepartoCobranzaHtml(data) {
   .planeo-producto-nombre {
     font-size: 9px;
     font-weight: 600;
-    color: #fefce8;
+    color: #111827;
   }
   .planeo-producto-precio {
     font-size: 9px;
-    color: #bbf7d0;
+    color: #047857;
   }
   .planeo-producto-extra {
     margin-top: 1px;
     font-size: 8.5px;
-    color: rgba(248,250,252,0.85);
+    color: #4b5563;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -904,17 +904,17 @@ function buildReporteRepartoCobranzaHtml(data) {
     font-size: 8px;
     text-transform: uppercase;
     letter-spacing: .08em;
-    color: rgba(248,250,252,0.85);
+    color: #4b5563;
   }
   .planeo-cant-box {
     display: inline-block;
     min-width: 32px;
     height: 9px;
-    border-bottom: 1px solid rgba(248,250,252,0.85);
+    border-bottom: 1px solid #111827;
   }
   .planeo-hist {
     font-size: 8px;
-    color: rgba(148,163,184,0.95);
+    color: #6b7280;
   }
 
   .planeo-observacion {
@@ -922,23 +922,23 @@ function buildReporteRepartoCobranzaHtml(data) {
   }
   .planeo-observ-label {
     font-size: 8.5px;
-    color: rgba(248,250,252,0.8);
+    color: #4b5563;
     margin-bottom: 1px;
   }
   .planeo-observ-box {
     border-radius: 8px;
-    border: 1px dashed rgba(148,163,184,0.9);
+    border: 1px dashed #d1d5db;
     height: 32px;
   }
 
   footer {
     margin-top: 8px;
     padding-top: 5px;
-    border-top: 1px solid rgba(148,163,184,0.6);
+    border-top: 1px solid #e5e7eb;
     display: flex;
     justify-content: space-between;
     font-size: 8px;
-    color: rgba(148,163,184,0.9);
+    color: #6b7280;
   }
 </style>
 </head>
