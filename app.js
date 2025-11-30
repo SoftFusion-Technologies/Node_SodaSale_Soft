@@ -33,9 +33,12 @@ if (process.env.NODE_ENV !== 'production') {
 import './Models/Geografia/relacionesGeografia.js';
 import initVendedoresRelations from './Models/Vendedores/relacionesVendedores.js';
 import initRelacionesVentasCxC from './Models/relacionesVentasCxC.js';
+import initRelacionesRepartos from './Models/Repartos/relacionesRepartos.js';
 
 initVendedoresRelations();
-initRelacionesVentasCxC()
+initRelacionesVentasCxC();
+initRelacionesRepartos();
+
 // const PORT = process.env.PORT || 3000;
 
 // console.log(process.env.PORT)
@@ -55,7 +58,7 @@ const corsOptions = {
   allowedHeaders: [
     'Content-Type',
     'Authorization',
-    'X-User-Id', // ✅ agrega tu header custom
+    'X-User-Id', // agrega  header custom
     'x-user-id',
     'Idempotency-Key',
     'idempotency-key',

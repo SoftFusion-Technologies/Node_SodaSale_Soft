@@ -35,7 +35,11 @@ import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
 import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 import { VendedoresModel } from '../../Models/Vendedores/MD_TB_Vendedores.js';
 
-// ---------- Includes: geografía + vendedor preferido ----------
+// nuevas relaciones con repartos
+import { RepartosModel } from '../../Models/Repartos/MD_TB_Repartos.js';
+import { RepartoClientesModel } from '../../Models/Repartos/MD_TB_RepartoClientes.js';
+
+// ---------- Includes: geografía + vendedor preferido + repartos ----------
 const incFull = [
   {
     model: BarriosModel,
@@ -60,8 +64,22 @@ const incFull = [
     model: VendedoresModel,
     as: 'vendedor_preferido',
     attributes: ['id', 'nombre', 'estado', 'email', 'telefono']
+  },
+  // 👉 NUEVO: asignaciones de reparto
+  {
+    model: RepartoClientesModel,
+    as: 'asignaciones_repartos',
+    attributes: ['id', 'reparto_id', 'numero_rango', 'estado'],
+    include: [
+      {
+        model: RepartosModel,
+        as: 'reparto',
+        attributes: ['id', 'nombre', 'rango_min', 'rango_max', 'ciudad_id']
+      }
+    ]
   }
 ];
+
 
 // ---------- utilidades ----------
 const parsePagination = (req) => {
@@ -532,8 +550,10 @@ export const ER_Cliente_CTS = async (req, res) => {
     const hard = String(req.query.hard || '') === '1';
 
     if (hard) {
+      //  Intento de borrado físico
       await cli.destroy({ transaction: t });
     } else {
+      //  Baja lógica (estado = inactivo)
       await cli.update({ estado: 'inactivo' }, { transaction: t });
     }
 
@@ -543,7 +563,46 @@ export const ER_Cliente_CTS = async (req, res) => {
     try {
       if (!t.finished) await t.rollback();
     } catch {}
+
     console.error('ER_Cliente_CTS error:', err);
+
+    const sqlMsg =
+      err?.original?.sqlMessage ||
+      err?.parent?.sqlMessage ||
+      err?.message ||
+      '';
+
+    //  Caso específico: FK en reparto_clientes
+    if (
+      err?.name === 'SequelizeForeignKeyConstraintError' &&
+      (sqlMsg.includes('`reparto_clientes`') ||
+        sqlMsg.includes('fk_repcli_cliente'))
+    ) {
+      return res.status(409).json({
+        code: 'CLIENTE_TIENE_REPARTOS',
+        mensajeError:
+          'No se puede eliminar el cliente porque está asociado a uno o más repartos.',
+        tips: [
+          'Quitá primero al cliente de todos los repartos donde esté asignado.',
+          'También podés usar baja lógica (estado = inactivo) en lugar de borrado físico.'
+        ]
+      });
+    }
+
+    //  Otros errores de FK (ventas, pedidos, etc.)
+    if (err?.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(409).json({
+        code: 'CLIENTE_TIENE_RELACIONES',
+        mensajeError:
+          'No se puede eliminar el cliente porque tiene registros relacionados (repartos, ventas u otros módulos).',
+        tips: [
+          'Revisá si el cliente participa en repartos, ventas o movimientos.',
+          'Usá baja lógica (estado = inactivo) si no querés perder el historial.'
+        ]
+      });
+    }
+
+    //  Fallback genérico
     return res.status(500).json({
       code: 'SERVER_ERROR',
       mensajeError: 'No se pudo eliminar el cliente.'

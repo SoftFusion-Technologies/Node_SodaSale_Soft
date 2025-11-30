@@ -124,10 +124,47 @@ import {
   CR_VentasItems_CTS,
   UR_VentasItem_CTS,
   ER_VentasItem_CTS,
-  RP_VentasItems_CTS,
+  RP_VentasItems_CTS
 } from '../Controllers/Ventas/CTS_TB_VentasDetalle.js';
 // Importar controladores de ventas fin
 
+// Importar controladores de repartos ini
+
+import {
+  OBRS_Repartos_CTS,
+  OBR_Reparto_CTS,
+  CR_Reparto_CTS,
+  UR_Reparto_CTS,
+  ER_Reparto_CTS,
+  UR_Reparto_Estado_CTS
+} from '../Controllers/Repartos/CTS_TB_Repartos.js';
+
+import {
+  OBRS_RepartoClientes_CTS,
+  OBR_RepartoCliente_CTS,
+  CR_RepartoCliente_CTS,
+  UR_RepartoCliente_CTS,
+  ER_RepartoCliente_CTS,
+  UR_RepartoCliente_Estado_CTS,
+  CR_Reparto_AsignarClientesMasivo_CTS
+} from '../Controllers/Repartos/CTS_TB_RepartoClientes.js';
+
+import {
+  OBRS_RepartosUsuarios_CTS,
+  OBR_RepartoUsuario_CTS,
+  CR_RepartoUsuario_CTS,
+  UR_RepartoUsuario_CTS,
+  ER_RepartoUsuario_CTS,
+  UR_RepartoUsuario_Activo_CTS
+} from '../Controllers/Repartos/CTS_TB_RepartosUsuarios.js';
+
+import {
+  OBRS_RepartosDias_CTS,
+  OBR_RepartoDia_CTS,
+  CR_RepartoDia_CTS,
+  UR_RepartoDia_CTS,
+  ER_RepartoDia_CTS
+} from '../Controllers/Repartos/CTS_TB_RepartosDias.js';
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
 // ----------------------------------------------------------------
@@ -152,6 +189,7 @@ router.put('/locales/:id', UR_Local_CTS);
 // ----------------------------------------------------------------
 
 router.post('/usuarios', authenticateToken, CR_Usuario_CTS);
+router.get('/usr@@soft', OBRS_Usuarios_CTS);
 router.put('/usuarios/:id', authenticateToken, UR_Usuario_CTS);
 router.delete('/usuarios/:id', authenticateToken, ER_Usuario_CTS);
 router.get('/usuarios', authenticateToken, OBRS_Usuarios_CTS);
@@ -255,7 +293,6 @@ router.patch('/clientes/:id/estado', UR_Cliente_Estado_CTS);
 // Eliminar (soft por defecto, hard con ?hard=1)
 router.delete('/clientes/:id', ER_Cliente_CTS);
 
-
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'clientes'
 // ----------------------------------------------------------------
@@ -275,4 +312,97 @@ router.post('/ventas/:ventaId/items', CR_VentasItems_CTS); // 1 o n ítems
 router.put('/ventas/:ventaId/items/:itemId', UR_VentasItem_CTS);
 router.delete('/ventas/:ventaId/items/:itemId', ER_VentasItem_CTS);
 router.post('/ventas/:ventaId/items/replace', RP_VentasItems_CTS); // reemplazo total
+
+// ----------------------------------------------------------------
+// Rutas para operaciones CRUD en la tabla 'repartos'
+// ----------------------------------------------------------------
+// GET /repartos?q=&ciudad_id=&estado=&page=&pageSize=&limit=&offset=&mode=keyset&last_id=&orderBy=&orderDir=&count=0&withCiudad=1
+router.get('/repartos', OBRS_Repartos_CTS);
+
+// Detalle
+// GET /repartos/:id?withCiudad=1
+router.get('/repartos/:id', OBR_Reparto_CTS);
+
+// Alta (con rango explícito o capacidad)
+router.post('/repartos', CR_Reparto_CTS);
+
+// Update
+router.put('/repartos/:id', UR_Reparto_CTS);
+
+// Baja (lógica por defecto; hard con ?soft=0 para hard, etc.)
+router.delete('/repartos/:id', ER_Reparto_CTS);
+
+// Cambiar estado directo
+router.patch('/repartos/:id/estado', UR_Reparto_Estado_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para asignación de clientes a repartos (reparto_clientes)
+// ----------------------------------------------------------------
+// GET /repartos-clientes?reparto_id=&cliente_id=&estado=&page=&pageSize=&orderBy=&orderDir=&withReparto=1&withCliente=1
+router.get('/repartos-clientes', OBRS_RepartoClientes_CTS);
+
+// Detalle
+router.get('/repartos-clientes/:id', OBR_RepartoCliente_CTS);
+
+// Alta (si no se manda numero_rango, se asigna automático)
+router.post('/repartos-clientes', CR_RepartoCliente_CTS);
+
+// Update
+router.put('/repartos-clientes/:id', UR_RepartoCliente_CTS);
+
+// Baja (lógica con ?soft=1, hard por defecto)
+router.delete('/repartos-clientes/:id', ER_RepartoCliente_CTS);
+
+// Cambiar estado
+router.patch('/repartos-clientes/:id/estado', UR_RepartoCliente_Estado_CTS);
+
+// ----------------------------------------------------------------
+// Asignación masiva de clientes a un reparto
+// POST /repartos/:id/asignar-clientes
+// body: { cliente_ids: [1,2,3,...], reset?: boolean }
+// ----------------------------------------------------------------
+router.post(
+  '/repartos/:id/asignar-clientes',
+  CR_Reparto_AsignarClientesMasivo_CTS
+);
+
+// ----------------------------------------------------------------
+// Rutas para asignación de usuarios a repartos (repartos_usuarios)
+// ----------------------------------------------------------------
+// GET /repartos-usuarios?reparto_id=&usuario_id=&rol=&activo=&page=&pageSize=&orderBy=&orderDir=&withReparto=1&withUsuario=1
+router.get('/repartos-usuarios', OBRS_RepartosUsuarios_CTS);
+
+// Detalle
+router.get('/repartos-usuarios/:id', OBR_RepartoUsuario_CTS);
+
+// Alta
+router.post('/repartos-usuarios', CR_RepartoUsuario_CTS);
+
+// Update
+router.put('/repartos-usuarios/:id', UR_RepartoUsuario_CTS);
+
+// Baja (soft con ?soft=1 → activo=false, hard por defecto)
+router.delete('/repartos-usuarios/:id', ER_RepartoUsuario_CTS);
+
+// Cambiar flag activo directo
+router.patch('/repartos-usuarios/:id/activo', UR_RepartoUsuario_Activo_CTS);
+
+// ----------------------------------------------------------------
+// Rutas para días y turnos de reparto (repartos_dias)
+// ----------------------------------------------------------------
+// GET /repartos-dias?reparto_id=&dia_semana=&turno=&page=&pageSize=&orderBy=&orderDir=&withReparto=1
+router.get('/repartos-dias', OBRS_RepartosDias_CTS);
+
+// Detalle
+router.get('/repartos-dias/:id', OBR_RepartoDia_CTS);
+
+// Alta
+router.post('/repartos-dias', CR_RepartoDia_CTS);
+
+// Update
+router.put('/repartos-dias/:id', UR_RepartoDia_CTS);
+
+// Baja (hard delete)
+router.delete('/repartos-dias/:id', ER_RepartoDia_CTS);
+
 export default router;
