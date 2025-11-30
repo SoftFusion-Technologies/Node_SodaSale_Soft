@@ -116,7 +116,9 @@ import {
   UR_Venta_CTS,
   UR_Venta_Anular_CTS,
   ER_Venta_CTS,
-  UR_Venta_RecalcularTotal_CTS
+  UR_Venta_RecalcularTotal_CTS,
+  CR_VentasReparto_Masiva_CTS,
+  OBRS_VentasDeudoresFiado_CTS
 } from '../Controllers/Ventas/CTS_TB_Ventas.js';
 
 import {
@@ -165,6 +167,22 @@ import {
   UR_RepartoDia_CTS,
   ER_RepartoDia_CTS
 } from '../Controllers/Repartos/CTS_TB_RepartosDias.js';
+
+// ----------------------------------------------------------------
+// Importamos controladores de Cobranzas a Clientes
+// ----------------------------------------------------------------
+import {
+  OBRS_CobranzasClientes_CTS,
+  OBR_CobranzaCliente_CTS,
+  CR_CobranzaCliente_CTS,
+  ER_CobranzaCliente_CTS
+} from '../Controllers/Cobranzas/CTS_TB_CobranzasClientes.js';
+
+// ----------------------------------------------------------------
+// CxC / Deuda de clientes
+// ----------------------------------------------------------------
+import { OBR_CxcDeudaCliente_CTS } from '../Controllers/Cobranzas/CTS_TB_CxcClientes.js';
+
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
 // ----------------------------------------------------------------
@@ -296,6 +314,7 @@ router.delete('/clientes/:id', ER_Cliente_CTS);
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'clientes'
 // ----------------------------------------------------------------
+router.get('/ventas/deudores-fiado', OBRS_VentasDeudoresFiado_CTS);
 router.get('/ventas', OBRS_Ventas_CTS);
 router.get('/ventas/:id', OBR_Venta_CTS);
 router.post('/ventas', CR_Venta_CTS);
@@ -303,7 +322,7 @@ router.put('/ventas/:id', UR_Venta_CTS);
 router.patch('/ventas/:id/anular', UR_Venta_Anular_CTS);
 router.delete('/ventas/:id', ER_Venta_CTS);
 router.post('/ventas/:ventaId/recalcular', UR_Venta_RecalcularTotal_CTS);
-
+router.post('/ventas/reparto-masiva', CR_VentasReparto_Masiva_CTS);
 // ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'clientes'
 // ----------------------------------------------------------------
@@ -404,5 +423,22 @@ router.put('/repartos-dias/:id', UR_RepartoDia_CTS);
 
 // Baja (hard delete)
 router.delete('/repartos-dias/:id', ER_RepartoDia_CTS);
+
+// ===============================
+// Rutas Cobranzas a Clientes
+// ===============================
+router.get('/cobranzas-clientes', OBRS_CobranzasClientes_CTS);
+
+router.get('/cobranzas-clientes/:id', OBR_CobranzaCliente_CTS);
+
+router.post('/cobranzas-clientes', CR_CobranzaCliente_CTS);
+
+// Usar con cuidado (ver comentario en controlador)
+router.delete('/cobranzas-clientes/:id', ER_CobranzaCliente_CTS);
+
+// ===============================
+// CxC - Deuda por cliente
+// ===============================
+router.get('/cxc/clientes/:id/deuda', OBR_CxcDeudaCliente_CTS);
 
 export default router;

@@ -37,7 +37,7 @@ import { VendedoresModel } from '../../Models/Vendedores/MD_TB_Vendedores.js';
 import { BarriosModel } from '../../Models/Geografia/MD_TB_Barrios.js';
 import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
 import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
-
+import CxcMovimientosModel from '../../Models/CuentasCorriente/MD_TB_CxcMovimientos.js';
 // -------- includes (cliente con geo) + vendedor + items opcionales --------
 const incClienteGeo = {
   model: ClientesModel,
@@ -162,6 +162,35 @@ async function validarVendedorActivo(id, t) {
   return v.id;
 }
 
+async function registrarCxcPorVenta(venta, t, descripcionExtra = '') {
+  if (!venta) return;
+
+  // Solo generamos CxC si la venta es fiada o a cuenta
+  if (!['fiado', 'a_cuenta'].includes(String(venta.tipo))) return;
+
+  const monto = Number(venta.total_neto) || 0;
+  if (monto <= 0) return;
+
+  const descBase = `Venta #${venta.id}`;
+  const desc =
+    descripcionExtra && descripcionExtra.trim()
+      ? `${descBase} · ${descripcionExtra.trim()}`
+      : descBase;
+
+  await CxcMovimientosModel.create(
+    {
+      cliente_id: venta.cliente_id,
+      fecha: venta.fecha,
+      signo: 1, // DEBE (aumenta deuda)
+      monto,
+      origen_tipo: 'venta',
+      origen_id: venta.id,
+      descripcion: desc
+    },
+    { transaction: t }
+  );
+}
+
 // Recalcula total_neto sumando subtotales del detalle (ROUND por línea)
 export async function recalcVentaTotal(ventaId, t) {
   const items = await VentasDetalleModel.findAll({
@@ -262,8 +291,7 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       });
     }
 
-    const finalWhere =
-      and.length > 0 ? { [Op.and]: [where, ...and] } : where;
+    const finalWhere = and.length > 0 ? { [Op.and]: [where, ...and] } : where;
 
     const [col, dir] = safeOrder(orderBy, orderDir);
 
@@ -298,7 +326,6 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       .json({ code: 'SERVER_ERROR', mensajeError: 'Error listando ventas.' });
   }
 };
-
 
 // ===============================
 // GET ONE - GET /ventas/:id  (incluye items)
@@ -708,6 +735,300 @@ export const UR_Venta_RecalcularTotal_CTS = async (req, res) => {
     return res.status(st).json({
       code,
       mensajeError: msg
+    });
+  }
+};
+
+// ===============================
+// CREATE MASIVO POR REPARTO
+// POST /ventas/reparto-masiva
+//
+// Body esperado:
+// {
+//   reparto_id: 1,
+//   fecha: "2025-11-29T00:00:00",
+//   tipo: "fiado", // contado | fiado | a_cuenta
+//   vendedor_id: 3,
+//   observaciones: "texto opcional",
+//   items: [
+//     {
+//       cliente_id: 4,
+//       lineas: [
+//         { producto_id: 10, cantidad: 3, precio_unit: 2500.0 },
+//         { producto_id: 11, cantidad: 1, precio_unit: 2300.0 }
+//       ]
+//     },
+//     ...
+//   ]
+// }
+// ===============================
+export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
+  const { reparto_id, fecha, tipo, vendedor_id, observaciones, items } =
+    req.body || {};
+
+  const vendId = normInt(vendedor_id);
+  const repId = normInt(reparto_id, null);
+
+  // Validaciones básicas
+  if (!Number.isFinite(vendId)) {
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      mensajeError: 'vendedor_id es obligatorio y debe ser numérico.'
+    });
+  }
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      mensajeError:
+        'Debe enviar al menos un ítem con cliente y sus líneas de productos.'
+    });
+  }
+
+  const fechaDT = fecha ? new Date(fecha) : new Date();
+  if (isNaN(fechaDT.getTime())) {
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      mensajeError: 'Fecha inválida.'
+    });
+  }
+
+  const tipoVenta = coerceTipo(tipo); // contado | fiado | a_cuenta
+  const obsGlobal = observaciones?.trim?.() || null;
+
+  const t = await db.transaction();
+  try {
+    // Validamos vendedor una sola vez
+    await validarVendedorActivo(vendId, t);
+
+    // Validamos estructura de items + clientes
+    const clientesIds = new Set();
+
+    const itemsNormalizados = items.map((item, idxCliente) => {
+      const cliId = normInt(item.cliente_id);
+      if (!Number.isFinite(cliId) || cliId <= 0) {
+        const e = new Error(`Cliente #${idxCliente + 1}: cliente_id inválido.`);
+        e.status = 400;
+        throw e;
+      }
+      if (!Array.isArray(item.lineas) || item.lineas.length === 0) {
+        const e = new Error(
+          `Cliente #${
+            idxCliente + 1
+          }: debe contener al menos una línea de producto.`
+        );
+        e.status = 400;
+        throw e;
+      }
+
+      // Normalizamos y validamos líneas reutilizando validarItemForCreate
+      const lineasNorm = item.lineas.map((ln, idxLinea) =>
+        validarItemForCreate(ln, idxLinea)
+      );
+
+      clientesIds.add(cliId);
+
+      return {
+        cliente_id: cliId,
+        lineas: lineasNorm
+      };
+    });
+
+    // Validar que todos los clientes existan
+    for (const cliId of clientesIds) {
+      await validarCliente(cliId, t);
+    }
+
+    const ventasCreadas = [];
+    let totalGeneral = 0;
+
+    // Por cada cliente creamos una venta + sus detalles
+    for (const group of itemsNormalizados) {
+      const { cliente_id: cliId, lineas } = group;
+
+      // Creamos cabecera de venta (una por cliente)
+      const venta = await VentasModel.create(
+        {
+          cliente_id: cliId,
+          vendedor_id: vendId,
+          fecha: fechaDT,
+          tipo: tipoVenta,
+          total_neto: 0,
+          observaciones: obsGlobal,
+          estado: 'confirmada'
+        },
+        { transaction: t }
+      );
+
+      // Cuerpo de detalle
+      const rowsDetalle = lineas.map((ln) => ({
+        venta_id: venta.id,
+        producto_id: ln.producto_id,
+        cantidad: ln.cantidad,
+        precio_unit: ln.precio_unit
+      }));
+
+      await VentasDetalleModel.bulkCreate(rowsDetalle, { transaction: t });
+
+      // Calculamos total_neto desde las líneas
+      let totalCli = rowsDetalle.reduce(
+        (acc, r) =>
+          acc + moneyRound(Number(r.cantidad) * Number(r.precio_unit)),
+        0
+      );
+      totalCli = moneyRound(totalCli);
+
+      await venta.update({ total_neto: totalCli }, { transaction: t });
+
+      // Registramos CxC si corresponde (fiado / a_cuenta)
+      const descExtra =
+        repId != null
+          ? `Reparto ${repId} · Cliente ${cliId}`
+          : `Reparto masivo cliente ${cliId}`;
+      await registrarCxcPorVenta(
+        { ...venta.get({ plain: true }), total_neto: totalCli },
+        t,
+        descExtra
+      );
+
+      ventasCreadas.push({
+        id: venta.id,
+        cliente_id: cliId,
+        total_neto: totalCli
+      });
+      totalGeneral += totalCli;
+    }
+
+    totalGeneral = moneyRound(totalGeneral);
+
+    await t.commit();
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: `Se generaron ${ventasCreadas.length} venta(s) para el reparto.`,
+      meta: {
+        ventasCreadas: ventasCreadas.length,
+        totalGeneral,
+        reparto_id: repId || null
+      },
+      ventas: ventasCreadas
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+
+    if (err?.message === 'CLIENTE_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Alguno de los clientes no existe.'
+      });
+    }
+    if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Vendedor no encontrado.'
+      });
+    }
+    if (err?.message === 'VENDEDOR_INACTIVO') {
+      return res.status(400).json({
+        code: 'VENDOR_INACTIVE',
+        mensajeError: 'El vendedor está inactivo.'
+      });
+    }
+    if (err?.status === 400) {
+      return res.status(400).json({
+        code: 'MODEL_VALIDATION',
+        mensajeError: err.message
+      });
+    }
+
+    console.error('CR_VentasReparto_Masiva_CTS error:', err);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudieron generar las ventas por reparto.'
+    });
+  }
+};
+
+export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
+  try {
+    const ventasFiado = await VentasModel.findAll({
+      where: {
+        tipo: 'fiado',
+        estado: 'confirmada' // si hay 'anulada', 'borrador', etc., podés excluirlas desde acá
+      },
+      include: [
+        {
+          model: ClientesModel,
+          as: 'cliente',
+          attributes: ['id', 'nombre', 'documento', 'email', 'telefono']
+        },
+        {
+          model: VendedoresModel,
+          as: 'vendedor',
+          attributes: ['id', 'nombre']
+        }
+      ],
+      order: [
+        ['cliente_id', 'ASC'],
+        ['fecha', 'DESC']
+      ]
+    });
+
+    const hoy = new Date();
+    const map = new Map();
+
+    for (const v of ventasFiado) {
+      const cli = v.cliente;
+      if (!cli) continue;
+
+      const key = cli.id;
+      const existente = map.get(key) || {
+        cliente_id: cli.id,
+        nombre: cli.nombre,
+        documento: cli.documento,
+        email: cli.email,
+        telefono: cli.telefono,
+        total_pendiente: 0,
+        dias_max_atraso: 0,
+        ventas: []
+      };
+
+      const totalVenta = Number(v.total_neto) || 0;
+      existente.total_pendiente += totalVenta;
+
+      const fechaVenta = new Date(v.fecha);
+      const diffMs = hoy - fechaVenta;
+      const diffDias = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+      if (diffDias > existente.dias_max_atraso) {
+        existente.dias_max_atraso = diffDias;
+      }
+
+      existente.ventas.push({
+        id: v.id,
+        fecha: v.fecha,
+        vendedor_id: v.vendedor_id,
+        vendedor_nombre: v.vendedor?.nombre || null,
+        tipo: v.tipo,
+        estado: v.estado,
+        total_neto: totalVenta,
+        observaciones: v.observaciones
+      });
+
+      map.set(key, existente);
+    }
+
+    const deudores = Array.from(map.values()).sort(
+      (a, b) => b.total_pendiente - a.total_pendiente
+    );
+
+    return res.json(deudores);
+  } catch (err) {
+    console.error('OBRS_VentasDeudoresFiado_CTS error:', err);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo obtener el resumen de deudores.'
     });
   }
 };
