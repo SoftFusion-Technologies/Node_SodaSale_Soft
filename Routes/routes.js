@@ -184,6 +184,14 @@ import {
 import { OBR_CxcDeudaCliente_CTS } from '../Controllers/Cobranzas/CTS_TB_CxcClientes.js';
 
 // ----------------------------------------------------------------
+// Reportes Reparto & Cobranzas
+// ----------------------------------------------------------------
+import {
+  OBR_ReporteRepartoCobranza_CTS,
+  OBR_ReporteRepartoCobranzaPDF_CTS
+} from '../Controllers/Reportes/CTS_TB_ReportesReparto.js';
+
+// ----------------------------------------------------------------
 // Rutas para operaciones CRUD en la tabla 'locales'
 // ----------------------------------------------------------------
 
@@ -440,5 +448,13 @@ router.delete('/cobranzas-clientes/:id', ER_CobranzaCliente_CTS);
 // CxC - Deuda por cliente
 // ===============================
 router.get('/cxc/clientes/:id/deuda', OBR_CxcDeudaCliente_CTS);
+
+// ===============================
+// REPORTES
+// ===============================
+router.get('/reportes/reparto-cobranza', OBR_ReporteRepartoCobranza_CTS);
+
+
+router.get('/reportes/reparto-cobranza/pdf', OBR_ReporteRepartoCobranzaPDF_CTS);
 
 export default router;
