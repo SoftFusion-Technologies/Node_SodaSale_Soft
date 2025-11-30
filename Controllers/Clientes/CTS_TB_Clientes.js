@@ -80,7 +80,6 @@ const incFull = [
   }
 ];
 
-
 // ---------- utilidades ----------
 const parsePagination = (req) => {
   const page = Math.max(1, parseInt(req.query.page ?? '1', 10));
@@ -267,7 +266,7 @@ export const CR_Cliente_CTS = async (req, res) => {
       vendedor_preferido_id, // opcional
       estado, // 'activo' | 'inactivo'
 
-      // 👉 Campos que sí existen en tu DDL
+      // Campos reales de dirección
       direccion_calle,
       direccion_numero,
       direccion_piso_dpto,
@@ -282,6 +281,7 @@ export const CR_Cliente_CTS = async (req, res) => {
       return Number.isFinite(n) ? n : null;
     };
 
+    // Único obligatorio: nombre
     if (!nombre || !String(nombre).trim()) {
       if (!t.finished) await t.rollback();
       return res.status(400).json({
@@ -290,29 +290,17 @@ export const CR_Cliente_CTS = async (req, res) => {
       });
     }
 
-    const bId = normInt(barrio_id);
-    if (!Number.isFinite(bId)) {
-      if (!t.finished) await t.rollback();
-      return res.status(400).json({
-        code: 'BAD_REQUEST',
-        mensajeError: 'barrio_id es obligatorio y numérico.'
-      });
+    // barrio_id ahora es OPCIONAL
+    const barrioIdParsed = toNumOrNull(barrio_id);
+
+    //  Vendedor preferido: opcional, pero si viene lo validamos activo
+    const vendedorParsed = toNumOrNull(vendedor_preferido_id);
+    let vendIdValidado = null;
+    if (vendedorParsed != null) {
+      // reutilizás tu helper de validación; si no existe o está inactivo, tira error
+      vendIdValidado = await validarVendedorActivo(vendedorParsed, t);
     }
 
-    // Validar barrio existente
-    const barr = await BarriosModel.findByPk(bId, { transaction: t });
-    if (!barr) {
-      if (!t.finished) await t.rollback();
-      return res
-        .status(404)
-        .json({ code: 'NOT_FOUND', mensajeError: 'Barrio no encontrado.' });
-    }
-
-
-    const vendIdValidado = await validarVendedorActivo(
-      vendedor_preferido_id,
-      t
-    );
     const nuevo = await ClientesModel.create(
       {
         nombre: String(nombre).trim(),
@@ -320,10 +308,11 @@ export const CR_Cliente_CTS = async (req, res) => {
         email: toNull(email?.trim?.() ?? email),
         documento: toNull(documento?.trim?.() ?? documento),
 
-        barrio_id: bId,
+        //  ahora puede ser NULL sin romper el DDL
+        barrio_id: barrioIdParsed,
+
         vendedor_preferido_id: vendIdValidado,
 
-        // ✅ Mapear campos de dirección reales del DDL
         direccion_calle: toNull(direccion_calle?.trim?.() ?? direccion_calle),
         direccion_numero: toNull(
           direccion_numero?.trim?.() ?? direccion_numero
@@ -342,7 +331,7 @@ export const CR_Cliente_CTS = async (req, res) => {
 
     await t.commit();
 
-    // Devolver enriquecido
+    // Devolver enriquecido con include (barrio/localidad/ciudad si los hubiera)
     const withAll = await ClientesModel.findByPk(nuevo.id, {
       include: incFull
     });
@@ -352,7 +341,7 @@ export const CR_Cliente_CTS = async (req, res) => {
       if (!t.finished) await t.rollback();
     } catch {}
 
-    // ⬇ Captura validaciones de Sequelize y envía 400 con tips
+    //  Captura validaciones de Sequelize y envía 400 con tips
     if (
       err?.name === 'SequelizeValidationError' ||
       err?.name === 'ValidationError'
@@ -365,23 +354,26 @@ export const CR_Cliente_CTS = async (req, res) => {
       });
     }
 
-    // if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
-    //   return res
-    //     .status(404)
-    //     .json({ code: 'NOT_FOUND', mensajeError: 'Vendedor no encontrado.' });
-    // }
+    if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Vendedor no encontrado.'
+      });
+    }
     if (err?.message === 'VENDEDOR_INACTIVO') {
       return res.status(400).json({
         code: 'VENDOR_INACTIVE',
         mensajeError: 'El vendedor está inactivo.'
       });
     }
+
     if (err?.name === 'SequelizeUniqueConstraintError') {
       return res.status(409).json({
         code: 'DUPLICATE',
         mensajeError: 'Conflicto de unicidad (verificá documento/email).'
       });
     }
+
     console.error('CR_Cliente_CTS error:', err);
     return res.status(500).json({
       code: 'SERVER_ERROR',
@@ -390,7 +382,9 @@ export const CR_Cliente_CTS = async (req, res) => {
   }
 };
 
-
+// ===============================
+// UPDATE - PUT /clientes/:id
+// ===============================
 // ===============================
 // UPDATE - PUT /clientes/:id
 // ===============================
@@ -419,43 +413,93 @@ export const UR_Cliente_CTS = async (req, res) => {
       email,
       documento,
       barrio_id,
-      vendedor_preferido_id, // ← nuevo (permite null para desasignar)
-      direccion,
+      vendedor_preferido_id, // opcional, permite null para desasignar
+      direccion_calle,
+      direccion_numero,
+      direccion_piso_dpto,
+      referencia,
       estado
     } = req.body || {};
 
-    const patch = {};
-    if (nombre !== undefined) patch.nombre = String(nombre).trim();
-    if (telefono !== undefined) patch.telefono = telefono || null;
-    if (email !== undefined) patch.email = email || null;
-    if (documento !== undefined) patch.documento = documento || null;
-    if (direccion !== undefined) patch.direccion = direccion || null;
-    if (estado !== undefined && ['activo', 'inactivo'].includes(String(estado)))
-      patch.estado = estado;
+    const toNull = (v) => (v === '' || v === undefined ? null : v);
+    const toNumOrNull = (v) => {
+      if (v === '' || v === undefined || v === null) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
 
-    if (barrio_id !== undefined) {
-      const bId = normInt(barrio_id);
-      if (!Number.isFinite(bId)) {
-        if (!t.finished) await t.rollback();
-        return res.status(400).json({
-          code: 'BAD_REQUEST',
-          mensajeError: 'barrio_id debe ser numérico.'
-        });
-      }
-      const barr = await BarriosModel.findByPk(bId, { transaction: t });
-      if (!barr) {
-        if (!t.finished) await t.rollback();
-        return res
-          .status(404)
-          .json({ code: 'NOT_FOUND', mensajeError: 'Barrio no encontrado.' });
-      }
-      patch.barrio_id = bId;
+    const patch = {};
+
+    // Campos básicos
+    if (nombre !== undefined) patch.nombre = String(nombre).trim();
+    if (telefono !== undefined) {
+      patch.telefono = toNull(telefono?.trim?.() ?? telefono);
+    }
+    if (email !== undefined) {
+      patch.email = toNull(email?.trim?.() ?? email);
+    }
+    if (documento !== undefined) {
+      patch.documento = toNull(documento?.trim?.() ?? documento);
     }
 
+    // Dirección desglosada
+    if (direccion_calle !== undefined) {
+      patch.direccion_calle = toNull(
+        direccion_calle?.trim?.() ?? direccion_calle
+      );
+    }
+    if (direccion_numero !== undefined) {
+      patch.direccion_numero = toNull(
+        direccion_numero?.trim?.() ?? direccion_numero
+      );
+    }
+    if (direccion_piso_dpto !== undefined) {
+      patch.direccion_piso_dpto = toNull(
+        direccion_piso_dpto?.trim?.() ?? direccion_piso_dpto
+      );
+    }
+    if (referencia !== undefined) {
+      patch.referencia = toNull(referencia?.trim?.() ?? referencia);
+    }
+
+    // Estado
+    if (
+      estado !== undefined &&
+      ['activo', 'inactivo'].includes(String(estado))
+    ) {
+      patch.estado = estado;
+    }
+
+    // 📍 barrio_id ahora es OPCIONAL: vacío/null desasigna, número válido setea
+    if (barrio_id !== undefined) {
+      if (barrio_id === '' || barrio_id === null) {
+        patch.barrio_id = null;
+      } else {
+        const bId = normInt(barrio_id);
+        if (!Number.isFinite(bId)) {
+          if (!t.finished) await t.rollback();
+          return res.status(400).json({
+            code: 'BAD_REQUEST',
+            mensajeError: 'barrio_id debe ser numérico.'
+          });
+        }
+        // si querés volver a validar existencia de barrio, acá va el findByPk
+        // const barr = await BarriosModel.findByPk(bId, { transaction: t });
+        // if (!barr) { ... 404 ... }
+        patch.barrio_id = bId;
+      }
+    }
+
+    // 👤 Vendedor preferido: opcional, null desasigna, si viene valor se valida activo
     if (vendedor_preferido_id !== undefined) {
-      const vendIdOpt = normOptInt(vendedor_preferido_id); // null desasigna
-      const vendIdValidado = await validarVendedorActivo(vendIdOpt, t);
-      patch.vendedor_preferido_id = vendIdValidado;
+      const vendParsed = toNumOrNull(vendedor_preferido_id);
+      if (vendParsed === null) {
+        // desasignar
+        patch.vendedor_preferido_id = null;
+      } else {
+        const vendIdValidado = await validarVendedorActivo(vendParsed, t);
+        patch.vendedor_preferido_id = vendIdValidado;
+      }
     }
 
     await cli.update(patch, { transaction: t });
@@ -467,15 +511,28 @@ export const UR_Cliente_CTS = async (req, res) => {
     try {
       if (!t.finished) await t.rollback();
     } catch {}
+
     if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
-      return res
-        .status(404)
-        .json({ code: 'NOT_FOUND', mensajeError: 'Vendedor no encontrado.' });
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Vendedor no encontrado.'
+      });
     }
     if (err?.message === 'VENDEDOR_INACTIVO') {
       return res.status(400).json({
         code: 'VENDOR_INACTIVE',
         mensajeError: 'El vendedor está inactivo.'
+      });
+    }
+    if (
+      err?.name === 'SequelizeValidationError' ||
+      err?.name === 'ValidationError'
+    ) {
+      const tips = (err.errors || []).map((e) => e.message);
+      return res.status(400).json({
+        code: 'MODEL_VALIDATION',
+        mensajeError: 'Hay campos inválidos. Revisá los valores ingresados.',
+        tips
       });
     }
     if (err?.name === 'SequelizeUniqueConstraintError') {
@@ -484,6 +541,7 @@ export const UR_Cliente_CTS = async (req, res) => {
         mensajeError: 'Conflicto de unicidad (documento).'
       });
     }
+
     console.error('UR_Cliente_CTS error:', err);
     return res.status(500).json({
       code: 'SERVER_ERROR',
@@ -491,6 +549,7 @@ export const UR_Cliente_CTS = async (req, res) => {
     });
   }
 };
+
 
 // ===============================
 // PATCH Estado - PATCH /clientes/:id/estado

@@ -66,7 +66,7 @@ export const ClientesModel = db.define(
     // FK → barrios (asociaciones se definirán por fuera)
     barrio_id: {
       type: DataTypes.INTEGER.UNSIGNED,
-      allowNull: false
+      allowNull: true
     },
 
     direccion_calle: {
