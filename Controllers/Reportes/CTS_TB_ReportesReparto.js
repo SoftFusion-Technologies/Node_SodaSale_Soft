@@ -130,7 +130,18 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
       {
         model: ClientesModel,
         as: 'cliente',
-        attributes: ['id', 'nombre', 'documento', 'telefono', 'email', 'estado']
+        attributes: [
+          'id',
+          'nombre',
+          'documento',
+          'telefono',
+          'email',
+          'estado',
+          'direccion_calle',
+          'direccion_numero',
+          'direccion_piso_dpto',
+          'referencia'
+        ]
       }
     ],
     order: [['numero_rango', 'ASC']]
@@ -151,7 +162,11 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
         nombre: rc.cliente.nombre,
         documento: rc.cliente.documento,
         telefono: rc.cliente.telefono,
-        email: rc.cliente.email
+        email: rc.cliente.email,
+        direccion_calle: rc.cliente.direccion_calle,
+        direccion_numero: rc.cliente.direccion_numero,
+        direccion_piso_dpto: rc.cliente.direccion_piso_dpto,
+        referencia: rc.cliente.referencia
       }
     });
 
@@ -572,6 +587,29 @@ function buildReporteRepartoCobranzaHtml(data) {
                 ${cliente.telefono && cliente.email ? ' · ' : ''}
                 ${cliente.email || ''}
               </div>
+               <div class="cliente-doc">
+                ${
+                  cliente.direccion_calle
+                    ? `Calle: ${cliente.direccion_calle}`
+                    : 'Sin calle'
+                }
+                 ${
+                   cliente.direccion_numero
+                     ? `Nro: ${cliente.direccion_numero}`
+                     : 'Sin Nro'
+                 }
+                  ${
+                    cliente.direccion_piso_dpto
+                      ? `Piso/Dpto: ${cliente.direccion_piso_dpto}`
+                      : 'Sin Piso'
+                  }
+                   ${
+                     cliente.referencia
+                       ? `Referencia: ${cliente.referencia}`
+                       : 'Sin Referencia'
+                   }
+
+              </div>
             </div>
             <div class="cliente-deuda">
               <div class="tag-deuda">Deuda total</div>
@@ -959,7 +997,6 @@ function buildReporteRepartoCobranzaHtml(data) {
 </body>
 </html>`;
 }
-
 
 /* ============================================================
  * 4) Endpoint PDF
