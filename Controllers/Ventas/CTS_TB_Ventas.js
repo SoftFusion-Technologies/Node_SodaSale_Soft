@@ -25,7 +25,7 @@
  * - orderDir: 'ASC'|'DESC'
  */
 
-import { Op } from 'sequelize';
+import { Op, fn, col } from 'sequelize';
 import db from '../../DataBase/db.js';
 
 import VentasModel from '../../Models/Ventas/MD_TB_Ventas.js';
@@ -38,6 +38,8 @@ import { BarriosModel } from '../../Models/Geografia/MD_TB_Barrios.js';
 import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
 import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 import CxcMovimientosModel from '../../Models/CuentasCorriente/MD_TB_CxcMovimientos.js';
+import { CobranzaAplicacionesModel } from '../../Models/Cobranzas/MD_TB_CobranzaAplicaciones.js';
+
 // -------- includes (cliente con geo) + vendedor + items opcionales --------
 const incClienteGeo = {
   model: ClientesModel,
@@ -951,12 +953,20 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
   }
 };
 
+// =============================================
+// GET /ventas/deudores-fiado
+// Devuelve deudores considerando cobranzas:
+// - Suma ventas fiado confirmadas
+// - Resta monto_aplicado en cobranza_aplicaciones
+// - Solo incluye ventas con saldo > 0
+// =============================================
 export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
   try {
+    // 1) Traer todas las ventas fiado confirmadas
     const ventasFiado = await VentasModel.findAll({
       where: {
         tipo: 'fiado',
-        estado: 'confirmada' // si hay 'anulada', 'borrador', etc., podés excluirlas desde acá
+        estado: 'confirmada'
       },
       include: [
         {
@@ -976,12 +986,50 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
       ]
     });
 
+    if (!ventasFiado.length) {
+      return res.json([]);
+    }
+
+    // 2) Buscar aplicaciones de cobranza para esas ventas usando SQL crudo
+    const ventasIds = ventasFiado.map((v) => v.id);
+
+    const [appsRows] = await db.query(
+      `
+      SELECT
+        venta_id,
+        SUM(monto_aplicado) AS total_aplicado
+      FROM cobranza_aplicaciones
+      WHERE venta_id IN (:ventasIds)
+      GROUP BY venta_id
+      `,
+      {
+        replacements: { ventasIds }
+      }
+    );
+
+    const appsByVenta = new Map();
+    for (const row of appsRows) {
+      const ventaId = Number(row.venta_id);
+      const totalAplicado = Number(row.total_aplicado) || 0;
+      appsByVenta.set(ventaId, totalAplicado);
+    }
+
+    // 3) Armar resumen por cliente considerando el saldo pendiente
     const hoy = new Date();
     const map = new Map();
 
     for (const v of ventasFiado) {
       const cli = v.cliente;
       if (!cli) continue;
+
+      const totalVenta = Number(v.total_neto) || 0;
+      const aplicado = appsByVenta.get(v.id) || 0;
+      const saldo = Math.max(0, totalVenta - aplicado);
+
+      // Si la venta está totalmente cobrada, la ignoramos
+      if (saldo <= 0.01) {
+        continue;
+      }
 
       const key = cli.id;
       const existente = map.get(key) || {
@@ -995,16 +1043,21 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
         ventas: []
       };
 
-      const totalVenta = Number(v.total_neto) || 0;
-      existente.total_pendiente += totalVenta;
+      // sumamos solo el saldo pendiente
+      existente.total_pendiente += saldo;
 
+      // días de atraso (desde la fecha de la venta)
       const fechaVenta = new Date(v.fecha);
       const diffMs = hoy - fechaVenta;
-      const diffDias = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+      const diffDias = Math.max(
+        0,
+        Math.floor(diffMs / (1000 * 60 * 60 * 24))
+      );
       if (diffDias > existente.dias_max_atraso) {
         existente.dias_max_atraso = diffDias;
       }
 
+      // guardamos la venta con su saldo pendiente
       existente.ventas.push({
         id: v.id,
         fecha: v.fecha,
@@ -1012,16 +1065,18 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
         vendedor_nombre: v.vendedor?.nombre || null,
         tipo: v.tipo,
         estado: v.estado,
-        total_neto: totalVenta,
+        total_neto: totalVenta, // total original
+        saldo: saldo, // saldo pendiente real
         observaciones: v.observaciones
       });
 
       map.set(key, existente);
     }
 
-    const deudores = Array.from(map.values()).sort(
-      (a, b) => b.total_pendiente - a.total_pendiente
-    );
+    // 4) Armar array de deudores (solo clientes con saldo > 0)
+    const deudores = Array.from(map.values())
+      .filter((d) => d.total_pendiente > 0.01)
+      .sort((a, b) => b.total_pendiente - a.total_pendiente);
 
     return res.json(deudores);
   } catch (err) {

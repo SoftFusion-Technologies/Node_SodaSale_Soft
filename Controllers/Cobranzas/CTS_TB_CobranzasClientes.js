@@ -291,7 +291,7 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
       });
     }
 
-    // 🔎 (Opcional) Validar que las ventas existan y sean del mismo cliente
+    //  (Opcional) Validar que las ventas existan y sean del mismo cliente
     const ventasIds = [
       ...new Set(
         apps.map((a) => normInt(a.venta_id)).filter((id) => Number.isFinite(id))
@@ -393,8 +393,7 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
 
 // ======================================================
 // 4) ELIMINAR - DELETE /cobranzas-clientes/:id
-//    ⚠ Pensado solo para corrección de pruebas / carga errónea.
-//    Si ya integrás CxC en serio, conviene manejar "anulación"
+//     Pensado solo para corrección de pruebas / carga errónea.
 //    lógica en vez de borrar.
 // ======================================================
 export const ER_CobranzaCliente_CTS = async (req, res) => {

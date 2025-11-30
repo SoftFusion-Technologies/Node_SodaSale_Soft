@@ -73,7 +73,7 @@ app.use(cors(corsOptions));
 
 app.use(express.json());
 
-// 👉 Montamos /time ANTES o DESPUÉS de GetRoutes; es un GET exacto y no interfiere
+//  Montamos /time ANTES o DESPUÉS de GetRoutes; es un GET exacto y no interfiere
 app.use(timeRouter); // <-- NUEVO
 
 app.use(

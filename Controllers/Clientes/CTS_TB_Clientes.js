@@ -65,7 +65,7 @@ const incFull = [
     as: 'vendedor_preferido',
     attributes: ['id', 'nombre', 'estado', 'email', 'telefono']
   },
-  // 👉 NUEVO: asignaciones de reparto
+  //  NUEVO: asignaciones de reparto
   {
     model: RepartoClientesModel,
     as: 'asignaciones_repartos',
