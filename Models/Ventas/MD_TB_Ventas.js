@@ -59,6 +59,18 @@ export const VentasModel = db.define(
       }
     },
 
+    monto_a_cuenta: {
+      type: DataTypes.DECIMAL(14, 2),
+      allowNull: false,
+      defaultValue: 0,
+      validate: {
+        isDecimal: { args: true, msg: 'monto_a_cuenta debe ser decimal.' },
+        min: { args: [0], msg: 'monto_a_cuenta no puede ser negativo.' }
+        // La validación "no superar total_neto" la hacemos en el servicio,
+        // porque acá no tenemos el valor del otro campo.
+      }
+    },
+
     observaciones: {
       type: DataTypes.STRING(255),
       allowNull: true,

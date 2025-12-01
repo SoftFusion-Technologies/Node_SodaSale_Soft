@@ -446,3 +446,78 @@ export const ER_CobranzaCliente_CTS = async (req, res) => {
     });
   }
 };
+
+// ======================================================
+// Helper interno reutilizable
+//  - Registrar una cobranza "a cuenta" asociada a UNA venta
+//  - Se usa desde otros módulos (ej: ventas por reparto)
+// ======================================================
+export async function registrarCobranzaACuentaPorVenta(
+  {
+    cliente_id,
+    vendedor_id = null,
+    fecha,
+    montoACuenta,
+    venta_id,
+    observacionesExtra
+  },
+  transaction
+) {
+  const total = Number(montoACuenta);
+
+  if (!Number.isFinite(total) || total <= 0) {
+    return null;
+  }
+
+  const fechaCobro =
+    fecha instanceof Date
+      ? fecha
+      : (() => {
+          const d = new Date(fecha || Date.now());
+          return Number.isNaN(d.getTime()) ? new Date() : d;
+        })();
+
+  const vendId = normOptInt(vendedor_id);
+
+  // 1) Cabecera de cobranza
+  const cobranza = await CobranzasClientesModel.create(
+    {
+      cliente_id,
+      vendedor_id: vendId,
+      fecha: fechaCobro,
+      total_cobrado: total,
+      observaciones:
+        observacionesExtra ||
+        `Pago a cuenta aplicado automáticamente a la venta #${venta_id}`
+    },
+    { transaction }
+  );
+
+  // 2) Movimiento en CxC (HABER = pago)
+  await CxcMovimientosModel.create(
+    {
+      cliente_id,
+      fecha: fechaCobro,
+      signo: -1,
+      monto: total,
+      origen_tipo: 'cobranza',
+      origen_id: cobranza.id,
+      descripcion:
+        observacionesExtra ||
+        `Cobranza a cuenta generada para venta #${venta_id}`
+    },
+    { transaction }
+  );
+
+  // 3) Aplicación a la venta
+  await CobranzaAplicacionesModel.create(
+    {
+      cobranza_id: cobranza.id,
+      venta_id,
+      monto_aplicado: total
+    },
+    { transaction }
+  );
+
+  return cobranza;
+}

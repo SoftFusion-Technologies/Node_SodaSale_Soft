@@ -40,6 +40,7 @@ import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 import CxcMovimientosModel from '../../Models/CuentasCorriente/MD_TB_CxcMovimientos.js';
 import { CobranzaAplicacionesModel } from '../../Models/Cobranzas/MD_TB_CobranzaAplicaciones.js';
 
+import { registrarCobranzaACuentaPorVenta } from '../Cobranzas/CTS_TB_CobranzasClientes.js';
 // -------- includes (cliente con geo) + vendedor + items opcionales --------
 const incClienteGeo = {
   model: ClientesModel,
@@ -740,33 +741,19 @@ export const UR_Venta_RecalcularTotal_CTS = async (req, res) => {
     });
   }
 };
-
-// ===============================
-// CREATE MASIVO POR REPARTO
-// POST /ventas/reparto-masiva
-//
-// Body esperado:
-// {
-//   reparto_id: 1,
-//   fecha: "2025-11-29T00:00:00",
-//   tipo: "fiado", // contado | fiado | a_cuenta
-//   vendedor_id: 3,
-//   observaciones: "texto opcional",
-//   items: [
-//     {
-//       cliente_id: 4,
-//       lineas: [
-//         { producto_id: 10, cantidad: 3, precio_unit: 2500.0 },
-//         { producto_id: 11, cantidad: 1, precio_unit: 2300.0 }
-//       ]
-//     },
-//     ...
-//   ]
-// }
-// ===============================
 export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
   const { reparto_id, fecha, tipo, vendedor_id, observaciones, items } =
     req.body || {};
+
+  console.log(
+    '[REPARTO-MASIVA] INICIO handler',
+    'reparto_id=',
+    reparto_id,
+    'vendedor_id=',
+    vendedor_id,
+    'items=',
+    Array.isArray(items) ? items.length : 0
+  );
 
   const vendId = normInt(vendedor_id);
   const repId = normInt(reparto_id, null);
@@ -799,11 +786,14 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
   const obsGlobal = observaciones?.trim?.() || null;
 
   const t = await db.transaction();
+
   try {
     // Validamos vendedor una sola vez
     await validarVendedorActivo(vendId, t);
 
-    // Validamos estructura de items + clientes
+    // -----------------------------
+    // 1) Normalizar items + validar
+    // -----------------------------
     const clientesIds = new Set();
 
     const itemsNormalizados = items.map((item, idxCliente) => {
@@ -813,6 +803,7 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
         e.status = 400;
         throw e;
       }
+
       if (!Array.isArray(item.lineas) || item.lineas.length === 0) {
         const e = new Error(
           `Cliente #${
@@ -823,7 +814,20 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
         throw e;
       }
 
-      // Normalizamos y validamos líneas reutilizando validarItemForCreate
+      // Aceptamos ambos nombres desde el front: a_cuenta o monto_a_cuenta
+      const montoACuentaRaw = item.a_cuenta ?? item.monto_a_cuenta ?? 0;
+      const montoACuentaNum = Number(montoACuentaRaw);
+
+      if (!Number.isFinite(montoACuentaNum) || montoACuentaNum < 0) {
+        const e = new Error(
+          `Cliente #${
+            idxCliente + 1
+          }: a_cuenta/monto_a_cuenta debe ser numérico y >= 0.`
+        );
+        e.status = 400;
+        throw e;
+      }
+
       const lineasNorm = item.lineas.map((ln, idxLinea) =>
         validarItemForCreate(ln, idxLinea)
       );
@@ -832,37 +836,41 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
 
       return {
         cliente_id: cliId,
+        monto_a_cuenta: montoACuentaNum, // nombre interno
         lineas: lineasNorm
       };
     });
 
-    // Validar que todos los clientes existan
+    // Validar que todos los clientes existan (una sola vez)
     for (const cliId of clientesIds) {
       await validarCliente(cliId, t);
     }
 
+    // -----------------------------
+    // 2) Crear ventas + detalle + CxC + cobranza a cuenta
+    // -----------------------------
     const ventasCreadas = [];
     let totalGeneral = 0;
 
-    // Por cada cliente creamos una venta + sus detalles
     for (const group of itemsNormalizados) {
-      const { cliente_id: cliId, lineas } = group;
+      const { cliente_id: cliId, lineas, monto_a_cuenta } = group;
 
-      // Creamos cabecera de venta (una por cliente)
+      // Cabecera inicial
       const venta = await VentasModel.create(
         {
           cliente_id: cliId,
           vendedor_id: vendId,
           fecha: fechaDT,
-          tipo: tipoVenta,
+          tipo: tipoVenta, // en este flujo, normalmente "fiado"
           total_neto: 0,
+          monto_a_cuenta: 0,
           observaciones: obsGlobal,
           estado: 'confirmada'
         },
         { transaction: t }
       );
 
-      // Cuerpo de detalle
+      // Detalle
       const rowsDetalle = lineas.map((ln) => ({
         venta_id: venta.id,
         producto_id: ln.producto_id,
@@ -872,7 +880,7 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
 
       await VentasDetalleModel.bulkCreate(rowsDetalle, { transaction: t });
 
-      // Calculamos total_neto desde las líneas
+      // Total mercadería
       let totalCli = rowsDetalle.reduce(
         (acc, r) =>
           acc + moneyRound(Number(r.cantidad) * Number(r.precio_unit)),
@@ -880,30 +888,73 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
       );
       totalCli = moneyRound(totalCli);
 
-      await venta.update({ total_neto: totalCli }, { transaction: t });
+      // Monto a cuenta no puede superar el total
+      let montoACuentaCli = Number(monto_a_cuenta || 0);
+      if (montoACuentaCli > totalCli) {
+        montoACuentaCli = totalCli;
+      }
+      montoACuentaCli = moneyRound(montoACuentaCli);
 
-      // Registramos CxC si corresponde (fiado / a_cuenta)
+      const deudaInicial = moneyRound(totalCli - montoACuentaCli);
+
+      // Actualizar cabecera
+      await venta.update(
+        {
+          total_neto: totalCli, // total mercadería
+          monto_a_cuenta: montoACuentaCli // pago en el momento
+        },
+        { transaction: t }
+      );
+
+      const ventaPlain = venta.get({ plain: true });
+
       const descExtra =
         repId != null
           ? `Reparto ${repId} · Cliente ${cliId}`
           : `Reparto masivo cliente ${cliId}`;
+
+      // Movimiento CxC por la venta (DEBE = total mercadería)
       await registrarCxcPorVenta(
-        { ...venta.get({ plain: true }), total_neto: totalCli },
+        { ...ventaPlain, total_neto: totalCli },
         t,
         descExtra
       );
 
+      // Si hay a cuenta, registramos la cobranza
+      if (montoACuentaCli > 0) {
+        await registrarCobranzaACuentaPorVenta(
+          {
+            cliente_id: cliId,
+            vendedor_id: vendId,
+            fecha: fechaDT,
+            montoACuenta: montoACuentaCli,
+            venta_id: venta.id,
+            observacionesExtra: `${descExtra} · A cuenta en misma jornada`
+          },
+          t
+        );
+      }
+
       ventasCreadas.push({
         id: venta.id,
         cliente_id: cliId,
-        total_neto: totalCli
+        total_neto: totalCli,
+        monto_a_cuenta: montoACuentaCli,
+        deuda_inicial: deudaInicial
       });
+
       totalGeneral += totalCli;
     }
 
     totalGeneral = moneyRound(totalGeneral);
 
     await t.commit();
+
+    console.log(
+      '[REPARTO-MASIVA] FIN handler',
+      'ventasCreadasIds=',
+      ventasCreadas.map((v) => v.id)
+    );
 
     return res.status(201).json({
       ok: true,
@@ -1049,10 +1100,7 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
       // días de atraso (desde la fecha de la venta)
       const fechaVenta = new Date(v.fecha);
       const diffMs = hoy - fechaVenta;
-      const diffDias = Math.max(
-        0,
-        Math.floor(diffMs / (1000 * 60 * 60 * 24))
-      );
+      const diffDias = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
       if (diffDias > existente.dias_max_atraso) {
         existente.dias_max_atraso = diffDias;
       }
