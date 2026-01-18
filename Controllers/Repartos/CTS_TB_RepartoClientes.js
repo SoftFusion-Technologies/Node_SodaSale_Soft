@@ -424,11 +424,17 @@ export const CR_Reparto_AsignarClientesMasivo_CTS = async (req, res) => {
   }
 
   const t = await db.transaction();
+
+  const safeRollback = async () => {
+    // Sequelize setea t.finished = 'commit' | 'rollback' cuando termina
+    if (!t.finished) await t.rollback();
+  };
+
   try {
     // 1) Validar reparto
     const reparto = await RepartosModel.findByPk(repartoId, { transaction: t });
     if (!reparto) {
-      await t.rollback();
+      await safeRollback();
       return res.status(404).json({
         code: 'NOT_FOUND',
         mensajeError: 'Reparto no encontrado.'
@@ -439,15 +445,19 @@ export const CR_Reparto_AsignarClientesMasivo_CTS = async (req, res) => {
     const rangoMax = Number(reparto.rango_max);
     const capacidadTotal = rangoMax - rangoMin + 1;
 
-    if (capacidadTotal <= 0) {
-      await t.rollback();
+    if (
+      !Number.isFinite(rangoMin) ||
+      !Number.isFinite(rangoMax) ||
+      capacidadTotal <= 0
+    ) {
+      await safeRollback();
       return res.status(400).json({
         code: 'RANGO_INVALIDO',
         mensajeError: 'El rango del reparto no es válido.'
       });
     }
 
-    // 2) Opcional: limpiar asignaciones previas
+    // 2) limpiar asignaciones previas
     if (reset === true || reset === 'true' || reset === 1 || reset === '1') {
       await RepartoClientesModel.destroy({
         where: { reparto_id: repartoId },
@@ -455,53 +465,78 @@ export const CR_Reparto_AsignarClientesMasivo_CTS = async (req, res) => {
       });
     }
 
-    // 3) Traer numeros_rango ya usados (luego de limpiar, si correspondía)
+    // 3) Traer asignaciones existentes 
     const existentes = await RepartoClientesModel.findAll({
       where: { reparto_id: repartoId },
-      attributes: ['numero_rango', 'cliente_id'],
+      attributes: ['id', 'numero_rango', 'cliente_id', 'estado'],
       order: [['numero_rango', 'ASC']],
-      transaction: t
+      transaction: t,
+      lock: t.LOCK.UPDATE
     });
 
-    const usados = new Set(existentes.map((x) => Number(x.numero_rango)));
-
-    const yaAsignadosIds = new Set(
-      existentes.map((x) => Number(x.cliente_id))
+    // Consideramos "ocupados" solo los ACTIVOS
+    const usados = new Set(
+      existentes
+        .filter((x) => String(x.estado || '').toLowerCase() === 'activo')
+        .map((x) => Number(x.numero_rango))
+        .filter((n) => Number.isFinite(n))
     );
 
-    const libresIniciales = capacidadTotal - usados.size;
+    const byCliente = new Map();
+    for (const x of existentes) {
+      byCliente.set(Number(x.cliente_id), x);
+    }
+
     const candidatos = cliente_ids
       .map((x) => Number(x))
       .filter((x) => Number.isFinite(x));
 
-    const nuevosCandidatos = candidatos.filter((idCli) => !yaAsignadosIds.has(idCli));
+    // Clasificar: nuevos / reactivar / ya activos
+    const nuevos = [];
+    const aReactivar = [];
+    const yaActivos = [];
 
-    if (nuevosCandidatos.length === 0) {
-      await t.rollback();
+    for (const idCli of candidatos) {
+      const row = byCliente.get(idCli);
+
+      if (!row) {
+        nuevos.push(idCli);
+        continue;
+      }
+
+      const est = String(row.estado || '').toLowerCase();
+      if (est === 'activo') yaActivos.push(idCli);
+      else aReactivar.push(row);
+    }
+
+    const libresIniciales = capacidadTotal - usados.size;
+    const necesarios = nuevos.length + aReactivar.length;
+
+    if (necesarios === 0) {
+      await safeRollback();
       return res.status(400).json({
-        code: 'SIN_NUEVOS_CLIENTES',
+        code: 'ALREADY_ASSIGNED',
         mensajeError:
           'Todos los clientes seleccionados ya están asignados a este reparto.'
       });
     }
 
-    if (nuevosCandidatos.length > libresIniciales) {
-      await t.rollback();
+    if (necesarios > libresIniciales) {
+      await safeRollback();
       return res.status(400).json({
-        code: 'CAPACIDAD_SUPERADA',
+        code: 'CAPACITY_EXCEEDED',
         mensajeError:
           'No hay espacio suficiente en el rango del reparto para todos los clientes seleccionados.',
         tips: [
           `Capacidad total del rango: ${capacidadTotal}`,
-          `Actualmente usados: ${usados.size}`,
+          `Actualmente usados (activos): ${usados.size}`,
           `Libres: ${libresIniciales}`,
-          `Seleccionados nuevos: ${nuevosCandidatos.length}`
+          `Nuevos a crear: ${nuevos.length}`,
+          `A reactivar: ${aReactivar.length}`,
+          `Total a activar: ${necesarios}`
         ]
       });
     }
-
-    // 4) Asignar numeros_rango libres para cada nuevo cliente
-    const asignados = [];
 
     const tomarHuecoLibre = () => {
       for (let n = rangoMin; n <= rangoMax; n++) {
@@ -510,15 +545,46 @@ export const CR_Reparto_AsignarClientesMasivo_CTS = async (req, res) => {
           return n;
         }
       }
-      return null; // no debería pasar si validamos capacidad antes
+      return null;
     };
 
-    for (const idCli of nuevosCandidatos) {
-      const numero_rango = tomarHuecoLibre();
-      if (numero_rango == null) {
-        // Seguridad extra
-        break;
+    const asignados = [];
+    const reactivados = [];
+
+    // 4) Reactivar: si su numero_rango viejo está libre y dentro del rango, lo reusa;
+    // si no, asigna uno nuevo libre.
+    for (const row of aReactivar) {
+      let nro = Number(row.numero_rango);
+
+      const nroOk =
+        Number.isFinite(nro) &&
+        nro >= rangoMin &&
+        nro <= rangoMax &&
+        !usados.has(nro);
+
+      if (!nroOk) {
+        nro = tomarHuecoLibre();
+      } else {
+        usados.add(nro);
       }
+
+      if (nro == null) {
+        // seguridad extra (no debería pasar si ya validamos capacidad)
+        throw new Error('No se encontró hueco libre para reactivación.');
+      }
+
+      await row.update(
+        { estado: 'activo', numero_rango: nro },
+        { transaction: t }
+      );
+
+      reactivados.push(row);
+    }
+
+    // 5) Crear nuevos
+    for (const idCli of nuevos) {
+      const numero_rango = tomarHuecoLibre();
+      if (numero_rango == null) break;
 
       const nuevo = await RepartoClientesModel.create(
         {
@@ -529,27 +595,34 @@ export const CR_Reparto_AsignarClientesMasivo_CTS = async (req, res) => {
         },
         { transaction: t }
       );
+
       asignados.push(nuevo);
     }
 
-    await t.commit();
-
-    return res.json({
+    // 6) Respuesta (armar antes del commit)
+    const payload = {
       ok: true,
-      message: 'Clientes asignados correctamente al reparto.',
+      message: 'Clientes procesados correctamente para el reparto.',
       meta: {
         reparto_id: repartoId,
         solicitados: candidatos.length,
-        nuevosCandidatos: nuevosCandidatos.length,
-        asignados: asignados.length,
+        creados: asignados.length,
+        reactivados: reactivados.length,
+        yaActivos: yaActivos.length,
         rango_min: rangoMin,
         rango_max: rangoMax
       },
-      data: asignados
-    });
+      asignados,
+      reactivados,
+      yaActivos
+    };
+
+    await t.commit();
+    return res.json(payload);
   } catch (err) {
     console.error('CR_Reparto_AsignarClientesMasivo_CTS error:', err);
-    await t.rollback();
+    await safeRollback();
+
     return res.status(500).json({
       code: 'SERVER_ERROR',
       mensajeError: 'Error asignando clientes al reparto.',
@@ -557,6 +630,8 @@ export const CR_Reparto_AsignarClientesMasivo_CTS = async (req, res) => {
     });
   }
 };
+
+
 export default {
   OBRS_RepartoClientes_CTS,
   OBR_RepartoCliente_CTS,

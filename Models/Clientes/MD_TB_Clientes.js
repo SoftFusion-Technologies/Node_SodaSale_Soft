@@ -63,6 +63,14 @@ export const ClientesModel = db.define(
       }
     },
 
+    // Benjamin Orellana - 16-01-2026
+    // Se agrega ciudad_id (FK a ciudades) para soportar "Ciudad obligatoria" sin localidad.
+
+    ciudad_id: {
+      type: DataTypes.INTEGER.UNSIGNED,
+      allowNull: true
+    },
+
     // FK → barrios (asociaciones se definirán por fuera)
     barrio_id: {
       type: DataTypes.INTEGER.UNSIGNED,
@@ -138,7 +146,9 @@ export const ClientesModel = db.define(
 
     indexes: [
       { name: 'uq_clientes_documento', unique: true, fields: ['documento'] },
-      { name: 'idx_clientes_barrio', fields: ['barrio_id'] },
+      // Benjamin Orellana - 16-01-2026
+      { name: 'idx_clientes_ciudad', fields: ['ciudad_id'] },
+      // Benjamin Orellana - 16-01-2026
       { name: 'idx_clientes_estado', fields: ['estado'] }
     ]
   }

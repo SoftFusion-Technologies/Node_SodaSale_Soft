@@ -212,22 +212,35 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
     saldosByCliente.set(cliId, saldo);
   }
 
-  // 4) Ventas fiado confirmadas
-  const whereVentasFiado = {
+  // 4) Ventas crédito confirmadas (fiado + a_cuenta)
+  const whereVentasCredito = {
     cliente_id: { [Op.in]: clienteIdList },
-    tipo: 'fiado',
+    tipo: { [Op.in]: ['fiado', 'a_cuenta'] },
     estado: 'confirmada'
   };
 
   if (dDesde || dHasta) {
-    whereVentasFiado.fecha = {};
-    if (dDesde) whereVentasFiado.fecha[Op.gte] = dDesde;
-    if (dHasta) whereVentasFiado.fecha[Op.lte] = dHasta;
+    whereVentasCredito.fecha = {};
+    if (dDesde) whereVentasCredito.fecha[Op.gte] = dDesde;
+    if (dHasta) whereVentasCredito.fecha[Op.lte] = dHasta;
   }
 
-  const ventasFiado = await VentasModel.findAll({
-    where: whereVentasFiado,
-    attributes: ['id', 'cliente_id', 'fecha', 'tipo', 'total_neto', 'estado'],
+  const ventasCredito = await VentasModel.findAll({
+    where: whereVentasCredito,
+    // ======================================================
+    // Benjamin Orellana - 18-01-2026
+    // Incluimos monto_a_cuenta para detectar ventas saldadas aunque no haya aplicaciones
+    // ======================================================
+
+    attributes: [
+      'id',
+      'cliente_id',
+      'fecha',
+      'tipo',
+      'total_neto',
+      'monto_a_cuenta',
+      'estado'
+    ],
     order: [
       ['cliente_id', 'ASC'],
       ['fecha', 'ASC']
@@ -237,8 +250,8 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
   // 5) Aplicaciones de cobranza por venta
   let appsByVenta = new Map();
 
-  if (ventasFiado.length) {
-    const ventasIds = ventasFiado.map((v) => v.id);
+  if (ventasCredito.length) {
+    const ventasIds = ventasCredito.map((v) => v.id);
 
     const apps = await CobranzaAplicacionesModel.unscoped().findAll({
       where: {
@@ -261,9 +274,21 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
   const ventasPendientesPorCliente = new Map();
   const resumenFiadoPorCliente = new Map();
 
-  for (const v of ventasFiado) {
+  for (const v of ventasCredito) {
     const totalVenta = Number(v.total_neto) || 0;
-    const aplicado = appsByVenta.get(v.id) || 0;
+
+    // ======================================================
+    // Benjamin Orellana - 18-01-2026
+    // Aplicado puede venir por:
+    //  - ventas.monto_a_cuenta (caché/total pagado)
+    //  - cobranza_aplicaciones (sumatoria aplicada)
+    // Para evitar inconsistencias (y no duplicar), tomamos el MAYOR de ambos.
+    // Caso real: venta saldada con monto_a_cuenta=total pero sin apps => NO debe entrar como deuda.
+    // ======================================================
+    const aplicadoApps = Number(appsByVenta.get(v.id) || 0);
+    const aplicadoVenta = Number(v.monto_a_cuenta || 0);
+    const aplicado = Math.max(aplicadoApps, aplicadoVenta);
+
     const saldoVenta = Math.max(0, totalVenta - aplicado);
 
     // ignoramos ventas totalmente cobradas
@@ -378,9 +403,20 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
     const cliId = base.cliente_id;
     const saldoCliente = Number(saldosByCliente.get(cliId) || 0);
 
-    if (soloConDeuda && saldoCliente <= 0.01) continue;
-
     const ventasPend = ventasPendientesPorCliente.get(cliId) || [];
+    const deudaVentasPend = ventasPend.reduce(
+      (acc, x) => acc + Number(x.saldo_pendiente || 0),
+      0
+    );
+
+    // ======================================================
+    // Benjamin Orellana - 18-01-2026
+    // Si solo_con_deuda, consideramos deuda por CxC o por ventas pendientes.
+    // (Por si CxC y ventas quedan desincronizados alguna vez.)
+    // ======================================================
+    const tieneDeuda = saldoCliente > 0.01 || deudaVentasPend > 0.01;
+    if (soloConDeuda && !tieneDeuda) continue;
+
     const resumenFiado = resumenFiadoPorCliente.get(cliId) || {
       ventas_abiertas: 0,
       fecha_venta_mas_vieja: null,
@@ -389,7 +425,7 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
     const productosSug = productosSugeridosPorCliente.get(cliId) || [];
 
     deudaTotalZona += saldoCliente;
-    if (saldoCliente > 0.01) totalClientesConDeuda += 1;
+    if (tieneDeuda) totalClientesConDeuda += 1;
 
     clientesResp.push({
       cliente: base.cliente,
@@ -399,6 +435,11 @@ async function obtenerReporteRepartoCobranzaDatos(query) {
         numero_rango: base.numero_rango
       },
       deuda_total: saldoCliente,
+      // ======================================================
+      // Benjamin Orellana - 18-01-2026
+      // Campo extra (no rompe front si no lo usás) para UI/diagnóstico.
+      // ======================================================
+      deuda_ventas_pendientes: deudaVentasPend,
       resumen_fiado: resumenFiado,
       ventas_pendientes: ventasPend,
       productos_sugeridos: productosSug
@@ -447,7 +488,6 @@ export const OBR_ReporteRepartoCobranza_CTS = async (req, res) => {
     });
   }
 };
-
 /* ============================================================
  * 3) Builder HTML para PDF
  * ============================================================ */

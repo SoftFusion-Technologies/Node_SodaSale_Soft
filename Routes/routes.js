@@ -457,4 +457,11 @@ router.get('/reportes/reparto-cobranza', OBR_ReporteRepartoCobranza_CTS);
 
 router.get('/reportes/reparto-cobranza/pdf', OBR_ReporteRepartoCobranzaPDF_CTS);
 
+import { exportReporteRepartoCobranzaSimplePDF } from '../Controllers/Repartos/CTS_TB_ReporteRepartoCobranzaSimplePDF.js';
+
+router.get(
+  '/reportes/reparto-cobranza-simple/pdf',
+  exportReporteRepartoCobranzaSimplePDF
+);
+
 export default router;

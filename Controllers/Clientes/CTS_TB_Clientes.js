@@ -35,7 +35,8 @@ import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
 import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 import { VendedoresModel } from '../../Models/Vendedores/MD_TB_Vendedores.js';
 
-// nuevas relaciones con repartos
+// Benjamin Orellana - 16-01-2026
+// Asignación de reparto desde alta de cliente (reparto_clientes) con numero_rango automático.
 import { RepartosModel } from '../../Models/Repartos/MD_TB_Repartos.js';
 import { RepartoClientesModel } from '../../Models/Repartos/MD_TB_RepartoClientes.js';
 
@@ -135,6 +136,232 @@ async function validarVendedorActivo(rawVendedorId, t) {
   return vend.id;
 }
 
+const toNull = (v) => (v === '' || v === undefined ? null : v);
+
+const toNumOrNull = (v) => {
+  if (v === '' || v === undefined || v === null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+const trimStr = (v) => (v == null ? '' : String(v)).trim();
+
+// Benjamin Orellana - 16-01-2026 - Reparto debe existir, estar activo y pertenecer a la misma ciudad
+async function validarRepartoActivoDeCiudad({
+  reparto_id,
+  ciudad_id,
+  transaction
+}) {
+  const rep = await RepartosModel.findByPk(reparto_id, { transaction });
+  if (!rep) {
+    const e = new Error('REPARTO_NO_EXISTE');
+    throw e;
+  }
+  if (String(rep.estado) !== 'activo') {
+    const e = new Error('REPARTO_INACTIVO');
+    throw e;
+  }
+  if (Number(rep.ciudad_id) !== Number(ciudad_id)) {
+    const e = new Error('REPARTO_CIUDAD_MISMATCH');
+    throw e;
+  }
+  return rep;
+}
+
+// Benjamin Orellana - 16-01-2026 - Calcula primer numero_rango libre dentro del rango del reparto (con huecos)
+// Permite excluir un registro de reparto_clientes (por ejemplo al reactivar/editar el mismo).
+async function obtenerNumeroRangoDisponible({
+  reparto_id,
+  transaction,
+  excluirRepCliId = null
+}) {
+  const reparto = await RepartosModel.findByPk(reparto_id, { transaction });
+  if (!reparto) {
+    const e = new Error('REPARTO_NO_EXISTE');
+    throw e;
+  }
+  if (String(reparto.estado) !== 'activo') {
+    const e = new Error('REPARTO_INACTIVO');
+    throw e;
+  }
+
+  const min = Number(reparto.rango_min);
+  const max = Number(reparto.rango_max);
+
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) {
+    const e = new Error('REPARTO_RANGO_INVALIDO');
+    throw e;
+  }
+
+  const whereUsed = { reparto_id, estado: 'activo' };
+  if (excluirRepCliId) {
+    whereUsed.id = { [Op.ne]: excluirRepCliId };
+  }
+
+  const usadosRows = await RepartoClientesModel.findAll({
+    where: whereUsed,
+    attributes: ['numero_rango'],
+    order: [['numero_rango', 'ASC']],
+    transaction,
+    raw: true
+  });
+
+  let candidato = min;
+  for (const row of usadosRows) {
+    const n = Number(row.numero_rango);
+    if (!Number.isFinite(n)) continue;
+    if (n < candidato) continue;
+
+    if (n === candidato) {
+      candidato++;
+      continue;
+    }
+    // n > candidato => hueco encontrado
+    break;
+  }
+
+  const capacidad = max - min + 1;
+  const usados = usadosRows.length;
+
+  if (candidato > max) {
+    return {
+      ok: false,
+      reparto,
+      rango_min: min,
+      rango_max: max,
+      capacidad,
+      usados,
+      disponible: Math.max(0, capacidad - usados),
+      sugerido_numero_rango: null
+    };
+  }
+
+  return {
+    ok: true,
+    reparto,
+    rango_min: min,
+    rango_max: max,
+    capacidad,
+    usados,
+    disponible: Math.max(0, capacidad - usados),
+    sugerido_numero_rango: candidato
+  };
+}
+
+// Benjamin Orellana - 16-01-2026 - Asigna (o reactiva) un cliente a un reparto con numero_rango automático
+// - Deja inactiva cualquier asignación activa previa del cliente (a otros repartos).
+// - Si ya existe registro reparto_id+cliente_id, lo actualiza.
+// - Maneja concurrencia por uq_repcli_reparto_numero con reintentos.
+async function asignarClienteAReparto({
+  cliente_id,
+  reparto_id,
+  ciudad_id,
+  transaction
+}) {
+  await validarRepartoActivoDeCiudad({ reparto_id, ciudad_id, transaction });
+
+  // Si ya está activo en ese reparto, no reasignar cupo
+  const yaActivo = await RepartoClientesModel.findOne({
+    where: { cliente_id, reparto_id, estado: 'activo' },
+    transaction
+  });
+  if (yaActivo) {
+    return { ok: true, numero_rango: yaActivo.numero_rango };
+  }
+
+  // Desactivar cualquier asignación activa previa del cliente
+  await RepartoClientesModel.update(
+    { estado: 'inactivo' },
+    { where: { cliente_id, estado: 'activo' }, transaction }
+  );
+
+  // Ver si ya existe registro histórico para este reparto+cliente
+  const existente = await RepartoClientesModel.findOne({
+    where: { reparto_id, cliente_id },
+    transaction
+  });
+
+  // Reusar numero_rango si el histórico existe y ese numero no está tomado por otro
+  if (existente?.numero_rango != null) {
+    const tomado = await RepartoClientesModel.findOne({
+      where: {
+        reparto_id,
+        numero_rango: existente.numero_rango,
+        id: { [Op.ne]: existente.id }
+      },
+      transaction
+    });
+    if (!tomado) {
+      await existente.update({ estado: 'activo' }, { transaction });
+      return { ok: true, numero_rango: existente.numero_rango };
+    }
+  }
+
+  // Asignación automática con reintentos por concurrencia
+  for (let intento = 1; intento <= 3; intento++) {
+    const meta = await obtenerNumeroRangoDisponible({
+      reparto_id,
+      transaction,
+      excluirRepCliId: existente ? existente.id : null
+    });
+
+    if (!meta.ok || meta.sugerido_numero_rango == null) {
+      return {
+        ok: false,
+        code: 'REPARTO_SIN_CUPOS',
+        meta: {
+          reparto_id,
+          reparto_nombre: meta?.reparto?.nombre || null,
+          rango_min: meta?.rango_min ?? null,
+          rango_max: meta?.rango_max ?? null,
+          usados: meta?.usados ?? null,
+          capacidad: meta?.capacidad ?? null,
+          disponible: meta?.disponible ?? 0
+        }
+      };
+    }
+
+    try {
+      if (existente) {
+        await existente.update(
+          {
+            numero_rango: meta.sugerido_numero_rango,
+            estado: 'activo'
+          },
+          { transaction }
+        );
+      } else {
+        await RepartoClientesModel.create(
+          {
+            reparto_id,
+            cliente_id,
+            numero_rango: meta.sugerido_numero_rango,
+            estado: 'activo'
+          },
+          { transaction }
+        );
+      }
+
+      return { ok: true, numero_rango: meta.sugerido_numero_rango };
+    } catch (errIns) {
+      const isUnique =
+        errIns?.name === 'SequelizeUniqueConstraintError' ||
+        String(errIns?.original?.code || '').includes('ER_DUP_ENTRY');
+
+      if (!isUnique || intento === 3) throw errIns;
+    }
+  }
+
+  return { ok: false, code: 'REPARTO_ASIGNACION_FALLIDA' };
+}
+
+async function desasignarRepartoActivo({ cliente_id, transaction }) {
+  await RepartoClientesModel.update(
+    { estado: 'inactivo' },
+    { where: { cliente_id, estado: 'activo' }, transaction }
+  );
+}
+
 // ===============================
 // LIST - GET /clientes
 // ===============================
@@ -151,7 +378,13 @@ export const OBRS_Clientes_CTS = async (req, res) => {
       created_desde, // YYYY-MM-DD
       created_hasta, // YYYY-MM-DD
       orderBy = 'created_at',
-      orderDir = 'DESC'
+      orderDir = 'DESC',
+
+      // ======================================================
+      // Benjamin Orellana - 17-01-2026
+      // Nuevo filtro: reparto_id (para listar clientes asignados a un reparto)
+      // ======================================================
+      reparto_id
     } = req.query;
 
     const where = {};
@@ -170,6 +403,34 @@ export const OBRS_Clientes_CTS = async (req, res) => {
       if (desde && hasta) where.created_at = { [Op.between]: [desde, hasta] };
       else if (desde) where.created_at = { [Op.gte]: desde };
       else if (hasta) where.created_at = { [Op.lte]: hasta };
+    }
+
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // include dinámico: si viene reparto_id, filtramos por tabla puente
+    // NOTA: La relación existe como:
+    // ClientesModel.hasMany(RepartoClientesModel, { as:'asignaciones_repartos', foreignKey:'cliente_id' })
+    // ======================================================
+    const includeFinal = [...incFull];
+
+    if (reparto_id !== undefined && reparto_id !== null && reparto_id !== '') {
+      const repId = Number(reparto_id);
+      if (!Number.isInteger(repId) || repId <= 0) {
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'reparto_id debe ser numérico.'
+        });
+      }
+
+      includeFinal.push({
+        association: 'asignaciones_repartos',
+        attributes: [], // no necesitamos columnas de la tabla puente en el listado
+        required: true, // fuerza que solo vengan clientes asignados al reparto
+        where: {
+          reparto_id: repId,
+          estado: 'activo'
+        }
+      });
     }
 
     // Filtros por include (ciudad/localidad) y q
@@ -196,7 +457,7 @@ export const OBRS_Clientes_CTS = async (req, res) => {
 
     const { rows, count } = await ClientesModel.findAndCountAll({
       where: finalWhere,
-      include: incFull,
+      include: includeFinal,
       limit,
       offset,
       order: [[col, dir]],
@@ -222,6 +483,7 @@ export const OBRS_Clientes_CTS = async (req, res) => {
       .json({ code: 'SERVER_ERROR', mensajeError: 'Error listando clientes.' });
   }
 };
+
 
 // ===============================
 // GET ONE - GET /clientes/:id
@@ -266,22 +528,20 @@ export const CR_Cliente_CTS = async (req, res) => {
       vendedor_preferido_id, // opcional
       estado, // 'activo' | 'inactivo'
 
+      // Ciudad obligatoria por pedido de Sale - Benjamin Orellana - 16-01-2026
+      ciudad_id,
+
       // Campos reales de dirección
       direccion_calle,
       direccion_numero,
       direccion_piso_dpto,
-      referencia
+      referencia,
+
+      // Asignación inicial desde el modal de clientes Benjamin Orellana - 16-01-2026
+      reparto_id
     } = req.body || {};
 
-    // Helpers locales
-    const toNull = (v) => (v === '' || v === undefined ? null : v);
-    const toNumOrNull = (v) => {
-      if (v === '' || v === undefined || v === null) return null;
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-
-    // Único obligatorio: nombre
+    // Único obligatorio anterior: nombre
     if (!nombre || !String(nombre).trim()) {
       if (!t.finished) await t.rollback();
       return res.status(400).json({
@@ -290,37 +550,63 @@ export const CR_Cliente_CTS = async (req, res) => {
       });
     }
 
-    // barrio_id ahora es OPCIONAL
+    // Benjamin Orellana - 16-01-2026 - Nuevos obligatorios en ALTA
+    const ciudadParsed = toNumOrNull(ciudad_id);
+    if (ciudadParsed == null) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'La ciudad es obligatoria.'
+      });
+    }
+
+    const calleTrim = trimStr(direccion_calle);
+    if (!calleTrim) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'La calle es obligatoria.'
+      });
+    }
+
+    const numeroTrim = trimStr(direccion_numero);
+    if (!numeroTrim) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'El número de calle es obligatorio.'
+      });
+    }
+
+    // barrio_id opcional
     const barrioIdParsed = toNumOrNull(barrio_id);
 
-    //  Vendedor preferido: opcional, pero si viene lo validamos activo
+    // Vendedor preferido opcional, si viene se valida activo
     const vendedorParsed = toNumOrNull(vendedor_preferido_id);
     let vendIdValidado = null;
     if (vendedorParsed != null) {
-      // reutilizás tu helper de validación; si no existe o está inactivo, tira error
       vendIdValidado = await validarVendedorActivo(vendedorParsed, t);
     }
 
     const nuevo = await ClientesModel.create(
       {
         nombre: String(nombre).trim(),
-        telefono: toNull(telefono?.trim?.() ?? telefono),
-        email: toNull(email?.trim?.() ?? email),
-        documento: toNull(documento?.trim?.() ?? documento),
+        telefono: toNull(trimStr(telefono)),
+        email: toNull(trimStr(email)),
+        documento: toNull(trimStr(documento)),
 
-        //  ahora puede ser NULL sin romper el DDL
+        // Benjamin Orellana - 16-01-2026 - Persistimos ciudad_id como dato principal
+        ciudad_id: ciudadParsed,
+
         barrio_id: barrioIdParsed,
-
         vendedor_preferido_id: vendIdValidado,
 
-        direccion_calle: toNull(direccion_calle?.trim?.() ?? direccion_calle),
-        direccion_numero: toNull(
-          direccion_numero?.trim?.() ?? direccion_numero
-        ),
-        direccion_piso_dpto: toNull(
-          direccion_piso_dpto?.trim?.() ?? direccion_piso_dpto
-        ),
-        referencia: toNull(referencia?.trim?.() ?? referencia),
+        // obligatorios en alta
+        direccion_calle: calleTrim,
+        direccion_numero: numeroTrim,
+
+        direccion_piso_dpto: toNull(trimStr(direccion_piso_dpto)),
+        referencia: toNull(trimStr(referencia)),
 
         estado: ['activo', 'inactivo'].includes(String(estado))
           ? estado
@@ -329,9 +615,34 @@ export const CR_Cliente_CTS = async (req, res) => {
       { transaction: t }
     );
 
+    // Benjamin Orellana - 16-01-2026 - Asignación inicial de reparto (opcional)
+    const repartoParsed = toNumOrNull(reparto_id);
+    if (repartoParsed != null) {
+      const r = await asignarClienteAReparto({
+        cliente_id: nuevo.id,
+        reparto_id: repartoParsed,
+        ciudad_id: ciudadParsed,
+        transaction: t
+      });
+
+      if (!r.ok) {
+        if (!t.finished) await t.rollback();
+        return res.status(409).json({
+          code: r.code,
+          mensajeError:
+            'El reparto seleccionado no tiene números de rango disponibles dentro de su rango configurado.',
+          meta: r.meta,
+          tips: [
+            'Seleccioná otro reparto.',
+            'O ajustá el rango del reparto para ampliar capacidad.'
+          ]
+        });
+      }
+    }
+
     await t.commit();
 
-    // Devolver enriquecido con include (barrio/localidad/ciudad si los hubiera)
+    // Devolver enriquecido con include
     const withAll = await ClientesModel.findByPk(nuevo.id, {
       include: incFull
     });
@@ -341,7 +652,34 @@ export const CR_Cliente_CTS = async (req, res) => {
       if (!t.finished) await t.rollback();
     } catch {}
 
-    //  Captura validaciones de Sequelize y envía 400 con tips
+    // Reparto: errores específicos
+    if (err?.message === 'REPARTO_NO_EXISTE') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Reparto no encontrado.'
+      });
+    }
+    if (err?.message === 'REPARTO_INACTIVO') {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'El reparto está inactivo.'
+      });
+    }
+    if (err?.message === 'REPARTO_CIUDAD_MISMATCH') {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError:
+          'El reparto seleccionado no pertenece a la ciudad elegida.'
+      });
+    }
+    if (err?.message === 'REPARTO_RANGO_INVALIDO') {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'El reparto tiene un rango inválido configurado.'
+      });
+    }
+
+    // Sequelize validations
     if (
       err?.name === 'SequelizeValidationError' ||
       err?.name === 'ValidationError'
@@ -385,9 +723,6 @@ export const CR_Cliente_CTS = async (req, res) => {
 // ===============================
 // UPDATE - PUT /clientes/:id
 // ===============================
-// ===============================
-// UPDATE - PUT /clientes/:id
-// ===============================
 export const UR_Cliente_CTS = async (req, res) => {
   const t = await db.transaction();
   try {
@@ -407,20 +742,8 @@ export const UR_Cliente_CTS = async (req, res) => {
         .json({ code: 'NOT_FOUND', mensajeError: 'Cliente no encontrado.' });
     }
 
-    const {
-      nombre,
-      telefono,
-      email,
-      documento,
-      barrio_id,
-      vendedor_preferido_id, // opcional, permite null para desasignar
-      direccion_calle,
-      direccion_numero,
-      direccion_piso_dpto,
-      referencia,
-      estado
-    } = req.body || {};
-
+    const trimStr = (v) =>
+      v === null || v === undefined ? '' : String(v).trim();
     const toNull = (v) => (v === '' || v === undefined ? null : v);
     const toNumOrNull = (v) => {
       if (v === '' || v === undefined || v === null) return null;
@@ -428,38 +751,91 @@ export const UR_Cliente_CTS = async (req, res) => {
       return Number.isFinite(n) ? n : null;
     };
 
+    const {
+      nombre,
+      telefono,
+      email,
+      documento,
+      barrio_id,
+      vendedor_preferido_id, // opcional, permite null para desasignar
+      estado,
+
+      // Ciudad (puede cambiarse)
+      ciudad_id,
+
+      // Dirección
+      direccion_calle,
+      direccion_numero,
+      direccion_piso_dpto,
+      referencia,
+
+      // Asignación/edición de reparto desde el modal
+      reparto_id
+    } = req.body || {};
+
     const patch = {};
 
     // Campos básicos
-    if (nombre !== undefined) patch.nombre = String(nombre).trim();
-    if (telefono !== undefined) {
-      patch.telefono = toNull(telefono?.trim?.() ?? telefono);
-    }
-    if (email !== undefined) {
-      patch.email = toNull(email?.trim?.() ?? email);
-    }
-    if (documento !== undefined) {
-      patch.documento = toNull(documento?.trim?.() ?? documento);
+    if (nombre !== undefined) {
+      const n = trimStr(nombre);
+      if (!n) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'El nombre no puede quedar vacío.'
+        });
+      }
+      patch.nombre = n;
     }
 
-    // Dirección desglosada
+    if (telefono !== undefined) patch.telefono = toNull(trimStr(telefono));
+    if (email !== undefined) patch.email = toNull(trimStr(email));
+    if (documento !== undefined) patch.documento = toNull(trimStr(documento));
+
+    // Ciudad: si viene, validar numérica
+    let ciudadFinal = Number(cli.ciudad_id);
+    if (ciudad_id !== undefined) {
+      const c = toNumOrNull(ciudad_id);
+      if (c == null) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'La ciudad debe ser un ID válido.'
+        });
+      }
+      patch.ciudad_id = c;
+      ciudadFinal = c;
+    }
+
+    // Dirección: en update permitimos cambios, pero no permitir vaciar si el campo viene
     if (direccion_calle !== undefined) {
-      patch.direccion_calle = toNull(
-        direccion_calle?.trim?.() ?? direccion_calle
-      );
+      const calle = trimStr(direccion_calle);
+      if (!calle) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'La calle no puede quedar vacía.'
+        });
+      }
+      patch.direccion_calle = calle;
     }
     if (direccion_numero !== undefined) {
-      patch.direccion_numero = toNull(
-        direccion_numero?.trim?.() ?? direccion_numero
-      );
+      const num = trimStr(direccion_numero);
+      if (!num) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'El número de calle no puede quedar vacío.'
+        });
+      }
+      patch.direccion_numero = num;
     }
+
     if (direccion_piso_dpto !== undefined) {
-      patch.direccion_piso_dpto = toNull(
-        direccion_piso_dpto?.trim?.() ?? direccion_piso_dpto
-      );
+      patch.direccion_piso_dpto = toNull(trimStr(direccion_piso_dpto));
     }
     if (referencia !== undefined) {
-      patch.referencia = toNull(referencia?.trim?.() ?? referencia);
+      patch.referencia = toNull(trimStr(referencia));
     }
 
     // Estado
@@ -470,7 +846,7 @@ export const UR_Cliente_CTS = async (req, res) => {
       patch.estado = estado;
     }
 
-    // 📍 barrio_id ahora es OPCIONAL: vacío/null desasigna, número válido setea
+    // barrio_id opcional: vacío/null desasigna, número válido setea
     if (barrio_id !== undefined) {
       if (barrio_id === '' || barrio_id === null) {
         patch.barrio_id = null;
@@ -483,18 +859,14 @@ export const UR_Cliente_CTS = async (req, res) => {
             mensajeError: 'barrio_id debe ser numérico.'
           });
         }
-        // si querés volver a validar existencia de barrio, acá va el findByPk
-        // const barr = await BarriosModel.findByPk(bId, { transaction: t });
-        // if (!barr) { ... 404 ... }
         patch.barrio_id = bId;
       }
     }
 
-    // 👤 Vendedor preferido: opcional, null desasigna, si viene valor se valida activo
+    // Vendedor preferido: opcional, null desasigna, si viene valor se valida activo
     if (vendedor_preferido_id !== undefined) {
       const vendParsed = toNumOrNull(vendedor_preferido_id);
       if (vendParsed === null) {
-        // desasignar
         patch.vendedor_preferido_id = null;
       } else {
         const vendIdValidado = await validarVendedorActivo(vendParsed, t);
@@ -502,7 +874,53 @@ export const UR_Cliente_CTS = async (req, res) => {
       }
     }
 
+    // Persistir cambios del cliente
     await cli.update(patch, { transaction: t });
+
+    if (reparto_id !== undefined) {
+      const repParsed = toNumOrNull(reparto_id);
+
+      const actualActivo = await RepartoClientesModel.findOne({
+        where: { cliente_id: id, estado: 'activo' },
+        transaction: t
+      });
+
+      if (repParsed == null) {
+        // DESASIGNAR (solo si hay algo activo)
+        if (actualActivo) {
+          await desasignarRepartoActivo({ cliente_id: id, transaction: t });
+        }
+      } else {
+        // Si es el mismo reparto ya activo, NO reasignar numero_rango
+        if (
+          actualActivo &&
+          Number(actualActivo.reparto_id) === Number(repParsed)
+        ) {
+          // no-op
+        } else {
+          const r = await asignarClienteAReparto({
+            cliente_id: id,
+            reparto_id: repParsed,
+            ciudad_id: ciudadFinal,
+            transaction: t
+          });
+
+          if (!r.ok) {
+            if (!t.finished) await t.rollback();
+            return res.status(409).json({
+              code: r.code,
+              mensajeError:
+                'El reparto seleccionado no tiene números de rango disponibles dentro de su rango configurado.',
+              meta: r.meta,
+              tips: [
+                'Seleccioná otro reparto.',
+                'O ajustá el rango del reparto.'
+              ]
+            });
+          }
+        }
+      }
+    }
     await t.commit();
 
     const withAll = await ClientesModel.findByPk(id, { include: incFull });
@@ -511,6 +929,33 @@ export const UR_Cliente_CTS = async (req, res) => {
     try {
       if (!t.finished) await t.rollback();
     } catch {}
+
+    // Reparto: errores específicos
+    if (err?.message === 'REPARTO_NO_EXISTE') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Reparto no encontrado.'
+      });
+    }
+    if (err?.message === 'REPARTO_INACTIVO') {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'El reparto está inactivo.'
+      });
+    }
+    if (err?.message === 'REPARTO_CIUDAD_MISMATCH') {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError:
+          'El reparto seleccionado no pertenece a la ciudad elegida.'
+      });
+    }
+    if (err?.message === 'REPARTO_RANGO_INVALIDO') {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'El reparto tiene un rango inválido configurado.'
+      });
+    }
 
     if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
       return res.status(404).json({
@@ -524,6 +969,7 @@ export const UR_Cliente_CTS = async (req, res) => {
         mensajeError: 'El vendedor está inactivo.'
       });
     }
+
     if (
       err?.name === 'SequelizeValidationError' ||
       err?.name === 'ValidationError'
@@ -535,6 +981,7 @@ export const UR_Cliente_CTS = async (req, res) => {
         tips
       });
     }
+
     if (err?.name === 'SequelizeUniqueConstraintError') {
       return res.status(409).json({
         code: 'DUPLICATE',
@@ -549,7 +996,6 @@ export const UR_Cliente_CTS = async (req, res) => {
     });
   }
 };
-
 
 // ===============================
 // PATCH Estado - PATCH /clientes/:id/estado

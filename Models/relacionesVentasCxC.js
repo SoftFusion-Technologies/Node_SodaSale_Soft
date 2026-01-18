@@ -43,6 +43,8 @@ import { BarriosModel } from './Geografia/MD_TB_Barrios.js';
 // Opcional (pero recomendado para Detalle de Venta):
 import { ProductosModel } from './Productos/MD_TB_Productos.js';
 
+import { RepartosModel } from './Repartos/MD_TB_Repartos.js';
+
 export function initRelacionesVentasCxC() {
   // ===============================
   // Geografía / Zona
@@ -171,5 +173,12 @@ ClientesModel.belongsTo(VendedoresModel, {
 VendedoresModel.hasMany(ClientesModel, {
   as: 'clientes_preferidos',
   foreignKey: 'vendedor_preferido_id'
+});
+// Se agrega la relación de reparto en Ventas para poder filtrar Benjamin Orellana - 17-01-2026
+VentasModel.belongsTo(RepartosModel, {
+  foreignKey: 'reparto_id',
+  as: 'reparto',
+  onDelete: 'SET NULL',
+  onUpdate: 'CASCADE'
 });
 export default initRelacionesVentasCxC;

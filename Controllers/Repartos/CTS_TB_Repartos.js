@@ -19,11 +19,16 @@ import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 import { Op } from 'sequelize';
 
 // ---------- Helpers ----------
-
-// Devuelve true si hay algún reparto en esa ciudad cuyo rango se solape
-async function existeRangoSolapado({ ciudad_id, rango_min, rango_max, excluirId = null }) {
+// Benjamin Orellana - 16-01-2026
+// Nuevo helper: valida solapamiento de rangos de forma GLOBAL (entre ciudades)
+// y considerando solo repartos ACTIVOS para no bloquear por históricos inactivos.
+async function existeRangoSolapadoGlobal({
+  rango_min,
+  rango_max,
+  excluirId = null
+}) {
   const where = {
-    ciudad_id,
+    estado: 'activo',
     rango_min: { [Op.lte]: rango_max },
     rango_max: { [Op.gte]: rango_min }
   };
@@ -32,8 +37,133 @@ async function existeRangoSolapado({ ciudad_id, rango_min, rango_max, excluirId 
     where.id = { [Op.ne]: excluirId };
   }
 
-  const conflict = await RepartosModel.findOne({ where });
+  const conflict = await RepartosModel.findOne({
+    where,
+    // Intentamos traer ciudad para un error más descriptivo
+    include: [{ model: CiudadesModel, as: 'ciudad', required: false }]
+  });
+
   return conflict;
+}
+
+// Benjamin Orellana - 16-01-2026
+// Helpers: sugerencia inteligente del primer rango disponible (global) evitando "sugerencias encadenadas".
+async function obtenerIntervalosActivosGlobales({ excluirId = null } = {}) {
+  const where = { estado: 'activo' };
+  if (excluirId) where.id = { [Op.ne]: excluirId };
+
+  const rows = await RepartosModel.findAll({
+    where,
+    attributes: ['id', 'rango_min', 'rango_max'],
+    order: [
+      ['rango_min', 'ASC'],
+      ['rango_max', 'ASC']
+    ],
+    raw: true
+  });
+
+  // Merge de intervalos contiguos/solapados para tratarlo como "bloque ocupado"
+  const merged = [];
+  for (const r of rows) {
+    const a = Number(r.rango_min);
+    const b = Number(r.rango_max);
+    if (!merged.length) {
+      merged.push({ min: a, max: b });
+      continue;
+    }
+    const last = merged[merged.length - 1];
+
+    // si empieza antes o justo al siguiente del final => unir
+    if (a <= last.max + 1) {
+      last.max = Math.max(last.max, b);
+    } else {
+      merged.push({ min: a, max: b });
+    }
+  }
+
+  return merged;
+}
+
+// Devuelve el primer "desde" libre >= start, y hasta dónde es libre antes del próximo bloque ocupado.
+function primerHuecoDesde(merged = [], start = 1) {
+  let desde = Number(start);
+
+  for (const it of merged) {
+    if (it.max < desde) continue; // este bloque está antes
+    if (it.min <= desde && desde <= it.max) {
+      // estamos dentro de un bloque ocupado -> saltar al final + 1
+      desde = it.max + 1;
+      continue;
+    }
+    // it.min > desde => hay un hueco antes de este bloque
+    break;
+  }
+
+  // encontrar el próximo bloque ocupado para calcular "hasta"
+  let hasta = null;
+  for (const it of merged) {
+    if (it.min > desde) {
+      hasta = it.min - 1;
+      break;
+    }
+  }
+
+  return { desde, hasta };
+}
+
+// Busca el primer rango [min, min+span] que entre completo sin chocar.
+function primerHuecoQueEntre(merged = [], start = 1, span = 0) {
+  let min = Number(start);
+  const s = Number(span);
+
+  for (const it of merged) {
+    if (it.max < min) continue;
+
+    if (it.min <= min && min <= it.max) {
+      min = it.max + 1;
+      continue;
+    }
+
+    // it.min > min => hay hueco [min, it.min-1]
+    const huecoMax = it.min - 1;
+    if (min + s <= huecoMax) {
+      return { min, max: min + s };
+    }
+
+    // no entra antes del próximo bloque -> saltar al final del bloque (para evitar loop)
+    min = it.max + 1;
+  }
+
+  // después del último bloque, entra siempre
+  return { min, max: min + s };
+}
+
+// Sugiere:
+// 1) primer hueco real "desde/hasta" (para orientar)
+// 2) primer rango que entra del mismo tamaño que el solicitado (si aplica)
+async function sugerirRangoDisponibleGlobal({
+  rango_min,
+  rango_max,
+  excluirId = null
+}) {
+  const start = Number(rango_min);
+  const end = Number(rango_max);
+  const span = end - start; // mantiene el mismo "tamaño" (diferencia)
+
+  const merged = await obtenerIntervalosActivosGlobales({ excluirId });
+
+  const primer = primerHuecoDesde(merged, start);
+
+  let mismoTam = null;
+  if (Number.isFinite(span) && span >= 0) {
+    mismoTam = primerHuecoQueEntre(merged, primer.desde, span);
+  }
+
+  return {
+    primer_disponible_desde: primer.desde,
+    primer_disponible_hasta: primer.hasta, // null = sin límite (no hay próximo bloque)
+    sugerido_mismo_tamano: mismoTam // {min, max} o null
+  };
 }
 
 const stripEmpty = (obj = {}) => {
@@ -267,23 +397,45 @@ export const CR_Reparto_CTS = async (req, res) => {
       });
     }
 
-    // 🔍 Validar que en esa ciudad no haya rango solapado
-    const conflict = await existeRangoSolapado({
-      ciudad_id,
+    // Benjamin Orellana - 16-01-2026
+    // Validación GLOBAL: no permitir solapamiento de rangos entre ciudades (solo activos)
+    const conflict = await existeRangoSolapadoGlobal({
       rango_min,
       rango_max
     });
 
     if (conflict) {
+      const ciudadInfo = conflict?.ciudad?.nombre
+        ? `${conflict.ciudad.nombre} (ID ${conflict.ciudad_id})`
+        : `Ciudad ID ${conflict.ciudad_id}`;
+
+      // Benjamin Orellana - 16-01-2026
+      // Sugerencia inteligente: evita "301 -> 501 -> 1001 ..." y propone el primer hueco real.
+      const suggestion = await sugerirRangoDisponibleGlobal({
+        rango_min,
+        rango_max,
+        excluirId: null
+      });
       return res.status(409).json({
         code: 'DUPLICATE',
         mensajeError:
-          `Ya existe un reparto en esta ciudad cuyo rango de clientes ` +
-          `(${conflict.rango_min}–${conflict.rango_max}) se superpone con el rango ingresado (${rango_min}–${rango_max}).`,
+          `Ya existe un reparto ACTIVO cuyo rango de clientes ` +
+          `(${conflict.rango_min}–${conflict.rango_max}) se superpone con el rango ingresado (${rango_min}–${rango_max}). ` +
+          `Conflicto: "${conflict.nombre}" en ${ciudadInfo}.`,
         tips: [
-          'Ajustá el rango para que no se solape con otros repartos de la misma ciudad.',
-          'Ejemplo: si uno va de 1 a 300, el siguiente podría ir de 301 a 600.'
-        ]
+          suggestion?.primer_disponible_desde
+            ? `Disponible desde ${suggestion.primer_disponible_desde}${
+                suggestion.primer_disponible_hasta != null
+                  ? ` hasta ${suggestion.primer_disponible_hasta}`
+                  : ''
+              }.`
+            : 'Buscá un rango disponible que no se superponga.',
+          suggestion?.sugerido_mismo_tamano?.min != null
+            ? `Mismo tamaño sugerido: ${suggestion.sugerido_mismo_tamano.min}–${suggestion.sugerido_mismo_tamano.max}.`
+            : 'Los rangos son globales: no deben solaparse entre ciudades.',
+          'Ajustá el rango para que sea contiguo y no se superponga con el existente.'
+        ],
+        suggestion
       });
     }
 
@@ -310,7 +462,6 @@ export const CR_Reparto_CTS = async (req, res) => {
     });
   }
 };
-
 
 // ---------- ACTUALIZAR (PUT /repartos/:id) ----------
 export const UR_Reparto_CTS = async (req, res) => {
@@ -375,23 +526,47 @@ export const UR_Reparto_CTS = async (req, res) => {
       });
     }
 
-    const conflict = await existeRangoSolapado({
-      ciudad_id,
+    // Benjamin Orellana - 16-01-2026
+    // Validación GLOBAL: no permitir solapamiento de rangos entre ciudades (solo activos)
+    const conflict = await existeRangoSolapadoGlobal({
       rango_min,
       rango_max,
       excluirId: Number(id)
     });
 
     if (conflict) {
+      const ciudadInfo = conflict?.ciudad?.nombre
+        ? `${conflict.ciudad.nombre} (ID ${conflict.ciudad_id})`
+        : `Ciudad ID ${conflict.ciudad_id}`;
+
+      // Benjamin Orellana - 16-01-2026
+      // Sugerencia inteligente: propone el primer hueco real y una opción del mismo tamaño.
+      const suggestion = await sugerirRangoDisponibleGlobal({
+        rango_min,
+        rango_max,
+        excluirId: Number(id)
+      });
+
       return res.status(409).json({
         code: 'DUPLICATE',
         mensajeError:
-          `Ya existe otro reparto en esta ciudad cuyo rango de clientes ` +
-          `(${conflict.rango_min}–${conflict.rango_max}) se superpone con el rango ingresado (${rango_min}–${rango_max}).`,
+          `Ya existe otro reparto ACTIVO cuyo rango de clientes ` +
+          `(${conflict.rango_min}–${conflict.rango_max}) se superpone con el rango ingresado (${rango_min}–${rango_max}). ` +
+          `Conflicto: "${conflict.nombre}" en ${ciudadInfo}.`,
         tips: [
-          'Ajustá el rango para que no se solape con otros repartos de la misma ciudad.',
-          'Podés dividir la zona en subrangos contiguos sin superponerlos.'
-        ]
+          suggestion?.primer_disponible_desde
+            ? `Disponible desde ${suggestion.primer_disponible_desde}${
+                suggestion.primer_disponible_hasta != null
+                  ? ` hasta ${suggestion.primer_disponible_hasta}`
+                  : ''
+              }.`
+            : 'Buscá un rango disponible que no se superponga.',
+          suggestion?.sugerido_mismo_tamano?.min != null
+            ? `Mismo tamaño sugerido: ${suggestion.sugerido_mismo_tamano.min}–${suggestion.sugerido_mismo_tamano.max}.`
+            : 'Los rangos son globales: no deben solaparse entre ciudades.',
+          'Ajustá el rango para que no se solape con el reparto existente.'
+        ],
+        suggestion
       });
     }
 
@@ -434,7 +609,6 @@ export const UR_Reparto_CTS = async (req, res) => {
     });
   }
 };
-
 
 // ---------- ELIMINAR (DELETE /repartos/:id) ----------
 export const ER_Reparto_CTS = async (req, res) => {
@@ -545,15 +719,43 @@ export const ER_Reparto_CTS = async (req, res) => {
   }
 };
 
-
 // ---------- Cambiar estado (PATCH /repartos/:id/estado) ----------
 export const UR_Reparto_Estado_CTS = async (req, res) => {
   try {
     const { id } = req.params;
     const { estado } = req.body;
 
-    if (!['activo', 'inactivo'].includes(String(estado))) {
-      return res.status(400).json({ mensajeError: 'Estado inválido' });
+    // Benjamin Orellana - 16-01-2026
+    // Si se intenta ACTIVAR un reparto, validar que su rango no se solape globalmente con otros activos.
+    if (String(estado) === 'activo') {
+      const existente = await RepartosModel.findByPk(id);
+      if (!existente) {
+        return res.status(404).json({ mensajeError: 'Reparto no encontrado' });
+      }
+
+      const conflict = await existeRangoSolapadoGlobal({
+        rango_min: Number(existente.rango_min),
+        rango_max: Number(existente.rango_max),
+        excluirId: Number(id)
+      });
+
+      if (conflict) {
+        const ciudadInfo = conflict?.ciudad?.nombre
+          ? `${conflict.ciudad.nombre} (ID ${conflict.ciudad_id})`
+          : `Ciudad ID ${conflict.ciudad_id}`;
+
+        return res.status(409).json({
+          code: 'DUPLICATE',
+          mensajeError:
+            `No se puede activar el reparto porque su rango ` +
+            `(${existente.rango_min}–${existente.rango_max}) se superpone con un reparto ACTIVO existente ` +
+            `(${conflict.rango_min}–${conflict.rango_max}). Conflicto: "${conflict.nombre}" en ${ciudadInfo}.`,
+          tips: [
+            'Ajustá el rango del reparto antes de activarlo.',
+            'O bien inactivá/modificá el reparto en conflicto.'
+          ]
+        });
+      }
     }
 
     const [n] = await RepartosModel.update({ estado }, { where: { id } });

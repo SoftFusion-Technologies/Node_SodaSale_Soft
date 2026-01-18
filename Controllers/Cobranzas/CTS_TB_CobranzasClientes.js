@@ -58,6 +58,85 @@ const parseDate = (v) => {
 };
 
 // ======================================================
+// Benjamin Orellana - 17/01/2026
+// Helpers para aplicar cobranzas a ventas (actualiza ventas.monto_a_cuenta)
+// ======================================================
+const moneyRound = (n) => Math.round(Number(n || 0) * 100) / 100;
+
+const getSaldoVenta = (ventaRow) => {
+  const total = Number(ventaRow?.total_neto ?? 0);
+  const aCuenta = Number(ventaRow?.monto_a_cuenta ?? 0);
+  return moneyRound(total - aCuenta);
+};
+
+async function lockVentaForUpdate(venta_id, transaction) {
+  return VentasModel.findByPk(venta_id, {
+    transaction,
+    lock: transaction.LOCK.UPDATE
+  });
+}
+
+// FIFO: aplica un monto a ventas abiertas del cliente (fecha ASC, id ASC)
+async function aplicarPagoFIFO({
+  cliente_id,
+  cobranza_id,
+  monto,
+  transaction
+}) {
+  let restante = moneyRound(monto);
+  const appRows = [];
+
+  if (restante <= 0) return { appRows, restante };
+
+  const ventas = await VentasModel.findAll({
+    where: {
+      cliente_id,
+      estado: 'confirmada',
+      tipo: { [Op.in]: ['fiado', 'a_cuenta'] }
+    },
+    order: [
+      ['fecha', 'ASC'],
+      ['id', 'ASC']
+    ],
+    transaction,
+    lock: transaction.LOCK.UPDATE
+  });
+
+  for (const v of ventas) {
+    if (restante <= 0) break;
+
+    const saldo = getSaldoVenta(v);
+    if (saldo <= 0) continue;
+
+    const aplicar = moneyRound(Math.min(restante, saldo));
+    if (aplicar <= 0) continue;
+
+    const nuevoACuenta = moneyRound(Number(v.monto_a_cuenta ?? 0) + aplicar);
+
+    // Seguridad por constraint: nunca exceder total_neto
+    if (nuevoACuenta - Number(v.total_neto ?? 0) > 0.01) {
+      const e = new Error(
+        `La aplicación excede el total de la venta #${v.id}.`
+      );
+      e.status = 400;
+      throw e;
+    }
+
+    await v.update({ monto_a_cuenta: nuevoACuenta }, { transaction });
+
+    appRows.push({
+      cobranza_id,
+      venta_id: v.id,
+      monto_aplicado: aplicar
+    });
+
+    restante = moneyRound(restante - aplicar);
+  }
+
+  return { appRows, restante };
+}
+
+// ======================================================
 // Includes base
 // ======================================================
 const incCliente = {
@@ -327,21 +406,131 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
       { transaction: t }
     );
 
-    // ---------- Crear aplicaciones ----------
-    if (apps.length) {
-      const rowsApps = apps
-        .filter((a) => Number(a.monto_aplicado) > 0)
-        .map((a) => ({
-          cobranza_id: nueva.id,
-          venta_id: normOptInt(a.venta_id),
-          monto_aplicado: Number(a.monto_aplicado)
-        }));
+    // ======================================================
+    // Benjamin Orellana - 17/01/2026
+    // Aplicar cobranza a ventas:
+    // - Si vienen aplicaciones => se respetan y además se actualiza ventas.monto_a_cuenta
+    // - Si NO vienen aplicaciones => auto FIFO a ventas abiertas (y resto a crédito si sobra)
+    // ======================================================
+    const appsIn = Array.isArray(aplicaciones) ? aplicaciones : [];
 
-      if (rowsApps.length) {
-        await CobranzaAplicacionesModel.bulkCreate(rowsApps, {
-          transaction: t
+    // Normalizar apps y agrupar por venta_id (evita duplicadas)
+    const mapVentaMonto = new Map();
+    let creditoExplicito = 0;
+
+    for (const a of appsIn) {
+      const monto = moneyRound(Number(a.monto_aplicado));
+      if (!Number.isFinite(monto) || monto <= 0) continue;
+
+      const vId = normOptInt(a.venta_id);
+
+      if (vId === null) {
+        creditoExplicito = moneyRound(creditoExplicito + monto);
+      } else {
+        mapVentaMonto.set(
+          vId,
+          moneyRound((mapVentaMonto.get(vId) || 0) + monto)
+        );
+      }
+    }
+
+    // 1) Si el usuario especificó aplicaciones a ventas, aplicarlas (y actualizar ventas)
+    const rowsApps = [];
+
+    const entries = Array.from(mapVentaMonto.entries()).sort(
+      (a, b) => a[0] - b[0]
+    );
+    for (const [venta_id, montoAplic] of entries) {
+      const venta = await lockVentaForUpdate(venta_id, t);
+
+      if (!venta || Number(venta.cliente_id) !== Number(cliId)) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError:
+            'Hay ventas aplicadas que no existen o no pertenecen al cliente.'
         });
       }
+
+      if (venta.estado !== 'confirmada') {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: `La venta #${venta_id} no está confirmada.`
+        });
+      }
+
+      const saldo = getSaldoVenta(venta);
+      if (montoAplic - saldo > 0.01) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: `Monto aplicado supera saldo de la venta #${venta_id}.`,
+          tips: [`Saldo actual: ${saldo}`, `Monto aplicado: ${montoAplic}`]
+        });
+      }
+
+      const nuevoACuenta = moneyRound(
+        Number(venta.monto_a_cuenta ?? 0) + montoAplic
+      );
+      await venta.update({ monto_a_cuenta: nuevoACuenta }, { transaction: t });
+
+      rowsApps.push({
+        cobranza_id: nueva.id,
+        venta_id,
+        monto_aplicado: montoAplic
+      });
+    }
+
+    // 2) Si NO vinieron aplicaciones (map vacío y sin crédito explícito), auto aplicar FIFO
+    const huboAppsExplicitas = mapVentaMonto.size > 0 || creditoExplicito > 0;
+
+    if (!huboAppsExplicitas) {
+      const { appRows, restante } = await aplicarPagoFIFO({
+        cliente_id: cliId,
+        cobranza_id: nueva.id,
+        monto: total,
+        transaction: t
+      });
+
+      rowsApps.push(...appRows);
+
+      // Si sobra, queda como crédito suelto (venta_id null)
+      if (restante > 0.01) {
+        rowsApps.push({
+          cobranza_id: nueva.id,
+          venta_id: null,
+          monto_aplicado: restante
+        });
+      }
+    } else {
+      // 3) Si vinieron apps explícitas y además vino crédito explícito, lo guardamos tal cual
+      if (creditoExplicito > 0.01) {
+        rowsApps.push({
+          cobranza_id: nueva.id,
+          venta_id: null,
+          monto_aplicado: creditoExplicito
+        });
+      }
+
+      // 4) Si apps explícitas no cubren el total, el resto también va a crédito suelto (determinista)
+      const sumRows = moneyRound(
+        rowsApps.reduce((acc, r) => acc + Number(r.monto_aplicado || 0), 0)
+      );
+
+      const resto = moneyRound(total - sumRows);
+      if (resto > 0.01) {
+        rowsApps.push({
+          cobranza_id: nueva.id,
+          venta_id: null,
+          monto_aplicado: resto
+        });
+      }
+    }
+
+    // 5) Persistir aplicaciones (si hay)
+    if (rowsApps.length) {
+      await CobranzaAplicacionesModel.bulkCreate(rowsApps, { transaction: t });
     }
 
     // ---------- Registrar movimiento en CxC ----------
@@ -417,16 +606,42 @@ export const ER_CobranzaCliente_CTS = async (req, res) => {
       });
     }
 
-    // Borrar aplicaciones primero (por las dudas, aunque hay ON DELETE CASCADE)
+    // ======================================================
+    // Benjamin Orellana - 17/01/2026
+    // Revertir efectos en ventas.monto_a_cuenta antes de borrar
+    // ======================================================
+    const apps = await CobranzaAplicacionesModel.findAll({
+      where: { cobranza_id: id },
+      transaction: t,
+      raw: true
+    });
+
+    for (const a of apps) {
+      if (!a.venta_id) continue;
+
+      const venta = await lockVentaForUpdate(a.venta_id, t);
+      if (!venta) continue;
+
+      const nuevoACuenta = moneyRound(
+        Number(venta.monto_a_cuenta ?? 0) - Number(a.monto_aplicado ?? 0)
+      );
+
+      await venta.update(
+        { monto_a_cuenta: Math.max(0, nuevoACuenta) },
+        { transaction: t }
+      );
+    }
+
+    // Borrar aplicaciones
     await CobranzaAplicacionesModel.destroy({
       where: { cobranza_id: id },
       transaction: t
     });
 
-     await CxcMovimientosModel.destroy({
-       where: { origen_tipo: 'cobranza', origen_id: id },
-       transaction: t
-     });
+    await CxcMovimientosModel.destroy({
+      where: { origen_tipo: 'cobranza', origen_id: id },
+      transaction: t
+    });
 
     await row.destroy({ transaction: t });
     await t.commit();
@@ -506,6 +721,39 @@ export async function registrarCobranzaACuentaPorVenta(
         observacionesExtra ||
         `Cobranza a cuenta generada para venta #${venta_id}`
     },
+    { transaction }
+  );
+
+  // ======================================================
+  // Benjamin Orellana - 17/01/2026
+  // Aplicar el pago a la venta (actualiza ventas.monto_a_cuenta)
+  // ======================================================
+  const venta = await VentasModel.findByPk(venta_id, {
+    transaction,
+    lock: transaction.LOCK.UPDATE
+  });
+
+  if (!venta || Number(venta.cliente_id) !== Number(cliente_id)) {
+    const e = new Error('VENTA_NO_VALIDA_PARA_CLIENTE');
+    e.status = 400;
+    throw e;
+  }
+
+  if (venta.estado !== 'confirmada') {
+    const e = new Error('VENTA_NO_CONFIRMADA');
+    e.status = 400;
+    throw e;
+  }
+
+  const saldo = getSaldoVenta(venta);
+  if (total - saldo > 0.01) {
+    const e = new Error('PAGO_SUPERA_SALDO_VENTA');
+    e.status = 400;
+    throw e;
+  }
+
+  await venta.update(
+    { monto_a_cuenta: moneyRound(Number(venta.monto_a_cuenta ?? 0) + total) },
     { transaction }
   );
 

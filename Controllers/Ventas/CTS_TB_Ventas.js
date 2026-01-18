@@ -25,7 +25,7 @@
  * - orderDir: 'ASC'|'DESC'
  */
 
-import { Op, fn, col } from 'sequelize';
+import { Op, fn, col, literal, where as sWhere } from 'sequelize';
 import db from '../../DataBase/db.js';
 
 import VentasModel from '../../Models/Ventas/MD_TB_Ventas.js';
@@ -39,7 +39,7 @@ import { LocalidadesModel } from '../../Models/Geografia/MD_TB_Localidades.js';
 import { CiudadesModel } from '../../Models/Geografia/MD_TB_Ciudades.js';
 import CxcMovimientosModel from '../../Models/CuentasCorriente/MD_TB_CxcMovimientos.js';
 import { CobranzaAplicacionesModel } from '../../Models/Cobranzas/MD_TB_CobranzaAplicaciones.js';
-
+import { RepartosModel } from '../../Models/Repartos/MD_TB_Repartos.js';
 import { registrarCobranzaACuentaPorVenta } from '../Cobranzas/CTS_TB_CobranzasClientes.js';
 // -------- includes (cliente con geo) + vendedor + items opcionales --------
 const incClienteGeo = {
@@ -180,8 +180,12 @@ async function registrarCxcPorVenta(venta, t, descripcionExtra = '') {
       ? `${descBase} · ${descripcionExtra.trim()}`
       : descBase;
 
-  await CxcMovimientosModel.create(
-    {
+  await CxcMovimientosModel.findOrCreate({
+    where: {
+      origen_tipo: 'venta',
+      origen_id: venta.id
+    },
+    defaults: {
       cliente_id: venta.cliente_id,
       fecha: venta.fecha,
       signo: 1, // DEBE (aumenta deuda)
@@ -190,9 +194,10 @@ async function registrarCxcPorVenta(venta, t, descripcionExtra = '') {
       origen_id: venta.id,
       descripcion: desc
     },
-    { transaction: t }
-  );
+    transaction: t
+  });
 }
+
 
 // Recalcula total_neto sumando subtotales del detalle (ROUND por línea)
 export async function recalcVentaTotal(ventaId, t) {
@@ -221,6 +226,12 @@ export async function recalcVentaTotal(ventaId, t) {
   return total;
 }
 
+const normOptInt = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+
 // ===============================
 // LIST - GET /ventas
 // ===============================
@@ -231,6 +242,7 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       q,
       cliente_id,
       vendedor_id,
+      reparto_id, // Benjamin Orellana - 17-01-2026 se agrega filtro reparto_id
       tipo,
       estado,
       desde,
@@ -238,15 +250,36 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       include,
       orderBy = 'fecha',
       orderDir = 'DESC',
-      // 👇 nuevos filtros de geografía
+      // nuevos filtros de geografía
       ciudad_id,
       localidad_id,
       barrio_id
     } = req.query;
 
+    const deuda = String(req.query.deuda ?? '') === '1';
+    const saldoMin = Number(req.query.saldo_min ?? 0.01);
+    const saldoThreshold = Number.isFinite(saldoMin) ? saldoMin : 0.01;
+
     const where = {};
+
     if (cliente_id) where.cliente_id = Number(cliente_id);
     if (vendedor_id) where.vendedor_id = Number(vendedor_id);
+
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // Filtro por reparto_id
+    // ======================================================
+    if (reparto_id !== undefined && reparto_id !== null && reparto_id !== '') {
+      const repId = Number(reparto_id);
+      if (!Number.isInteger(repId) || repId <= 0) {
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'reparto_id debe ser numérico.'
+        });
+      }
+      where.reparto_id = repId;
+    }
+
     if (tipo) where.tipo = coerceTipo(tipo);
     if (estado && ['confirmada', 'anulada'].includes(String(estado)))
       where.estado = String(estado);
@@ -258,10 +291,10 @@ export const OBRS_Ventas_CTS = async (req, res) => {
         d && h
           ? { [Op.between]: [d, h] }
           : d
-          ? { [Op.gte]: d }
-          : h
-          ? { [Op.lte]: h }
-          : undefined;
+            ? { [Op.gte]: d }
+            : h
+              ? { [Op.lte]: h }
+              : undefined;
     }
 
     const and = [];
@@ -279,26 +312,36 @@ export const OBRS_Ventas_CTS = async (req, res) => {
     }
 
     if (barrio_id) {
-      and.push({
-        '$cliente.barrio.id$': Number(barrio_id)
-      });
+      and.push({ '$cliente.barrio.id$': Number(barrio_id) });
     }
     if (localidad_id) {
-      and.push({
-        '$cliente.barrio.localidad.id$': Number(localidad_id)
-      });
+      and.push({ '$cliente.barrio.localidad.id$': Number(localidad_id) });
     }
     if (ciudad_id) {
-      and.push({
-        '$cliente.barrio.localidad.ciudad.id$': Number(ciudad_id)
-      });
+      and.push({ '$cliente.barrio.localidad.ciudad.id$': Number(ciudad_id) });
+    }
+
+    if (deuda) {
+      // Si el caller no fijó tipo/estado, forzamos defaults razonables para deuda
+      if (!tipo) where.tipo = { [Op.in]: ['fiado', 'a_cuenta'] };
+      if (!estado) where.estado = 'confirmada';
+
+      // Saldo = total_neto - monto_a_cuenta > 0
+      and.push(
+        sWhere(
+          literal('ROUND(IFNULL(total_neto,0) - IFNULL(monto_a_cuenta,0), 2)'),
+          { [Op.gt]: saldoThreshold }
+        )
+      );
     }
 
     const finalWhere = and.length > 0 ? { [Op.and]: [where, ...and] } : where;
-
     const [col, dir] = safeOrder(orderBy, orderDir);
 
-    const baseInc = [incClienteGeo, incVendedor];
+    const baseInc = [
+      incClienteGeo,
+      incVendedor /*, incReparto si querés mostrarlo */
+    ];
     if (String(include || '') === 'items') baseInc.push(incItems);
 
     const { rows, count } = await VentasModel.findAndCountAll({
@@ -370,11 +413,42 @@ export const OBR_Venta_CTS = async (req, res) => {
 // - Opcionalmente acepta items[] y calcula total_neto
 // ===============================
 export const CR_Venta_CTS = async (req, res) => {
-  const { cliente_id, vendedor_id, fecha, tipo, observaciones, items } =
-    req.body || {};
+  // incluir monto_a_cuenta
+  const {
+    cliente_id,
+    vendedor_id,
+    fecha,
+    tipo,
+    observaciones,
+    items,
+    monto_a_cuenta,
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // Nuevo: reparto_id (snapshot para filtrar por reparto)
+    // ======================================================
+    reparto_id
+  } = req.body || {};
 
   const cliId = normInt(cliente_id);
   const vendId = normInt(vendedor_id);
+
+  // ======================================================
+  // Benjamin Orellana - 17-01-2026
+  // Normalizamos reparto_id (si viene)
+  // ======================================================
+  const repartoIdIn =
+    reparto_id === null || reparto_id === undefined || reparto_id === ''
+      ? null
+      : Number(reparto_id);
+
+  if (reparto_id !== undefined && reparto_id !== null && reparto_id !== '') {
+    if (!Number.isInteger(repartoIdIn) || repartoIdIn <= 0) {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'reparto_id debe ser numérico.'
+      });
+    }
+  }
 
   if (!Number.isFinite(cliId) || !Number.isFinite(vendId)) {
     return res.status(400).json({
@@ -391,18 +465,59 @@ export const CR_Venta_CTS = async (req, res) => {
     });
   }
 
+  // ======================================================
+  // Benjamin Orellana - 17-01-2026
+  // Normalizamos a cuenta entrante (si viene)
+  // ======================================================
+  const aCuentaIn = moneyRound(Number(monto_a_cuenta || 0));
+  if (!Number.isFinite(aCuentaIn) || aCuentaIn < 0) {
+    return res.status(400).json({
+      code: 'BAD_REQUEST',
+      mensajeError: 'monto_a_cuenta debe ser numérico y >= 0.'
+    });
+  }
+
   const t = await db.transaction();
   try {
     await validarCliente(cliId, t);
     await validarVendedorActivo(vendId, t);
 
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // Validar reparto si vino (existencia + estado)
+    // NOTA: requiere tener importado RepartosModel en el archivo.
+    // ======================================================
+    if (repartoIdIn) {
+      const rep = await RepartosModel.findByPk(repartoIdIn, { transaction: t });
+      if (!rep) {
+        const e = new Error('REPARTO_NO_ENCONTRADO');
+        e.status = 404;
+        throw e;
+      }
+      if (rep.estado !== 'activo') {
+        const e = new Error('REPARTO_INACTIVO');
+        e.status = 400;
+        throw e;
+      }
+    }
+
+    // Si hay aCuenta, forzamos tipo a_cuenta (coherencia negocio)
+    const tipoFinal = aCuentaIn > 0 ? 'a_cuenta' : coerceTipo(tipo);
+
     const venta = await VentasModel.create(
       {
         cliente_id: cliId,
         vendedor_id: vendId,
+        // ======================================================
+        // Benjamin Orellana - 17-01-2026
+        // Persistimos reparto_id en venta (snapshot)
+        // ======================================================
+        reparto_id: repartoIdIn,
         fecha: fechaDT,
-        tipo: coerceTipo(tipo),
-        total_neto: 0, // se recalcula si hay items
+        tipo: tipoFinal,
+        total_neto: 0,
+        // IMPORTANTE: arrancamos en 0; el aCuenta real lo aplicará registrarCobranzaACuentaPorVenta
+        monto_a_cuenta: 0,
         observaciones: observaciones?.trim?.() || null,
         estado: 'confirmada'
       },
@@ -410,6 +525,8 @@ export const CR_Venta_CTS = async (req, res) => {
     );
 
     // Si vienen ítems, los creamos en el acto
+    let total = 0;
+
     if (Array.isArray(items) && items.length > 0) {
       const rows = items.map((it, i) => ({
         ...validarItemForCreate(it, i),
@@ -418,7 +535,7 @@ export const CR_Venta_CTS = async (req, res) => {
 
       await VentasDetalleModel.bulkCreate(rows, { transaction: t });
 
-      let total = rows.reduce(
+      total = rows.reduce(
         (acc, r) =>
           acc + moneyRound(Number(r.cantidad) * Number(r.precio_unit)),
         0
@@ -426,6 +543,50 @@ export const CR_Venta_CTS = async (req, res) => {
       total = moneyRound(total);
 
       await venta.update({ total_neto: total }, { transaction: t });
+
+      // ======================================================
+      // Benjamin Orellana - 18-01-2026
+      // Registrar CxC DEBE por la venta (fiado / a_cuenta)
+      // IMPORTANTÍSIMO: antes de generar cobranza a cuenta, para que el saldo quede neto.
+      // ======================================================
+      await registrarCxcPorVenta(
+        venta,
+        t,
+        repartoIdIn ? `Reparto ${repartoIdIn}` : ''
+      );
+    }
+
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // Validación y aplicación del pago inicial:
+    // - requiere total > 0 para validar contra saldo
+    // - crea Cobranza + CxC HABER + aplica a venta (ventas.monto_a_cuenta)
+    // ======================================================
+    if (aCuentaIn > 0.01) {
+      if (!(total > 0.01)) {
+        const e = new Error(
+          'Para registrar "a cuenta" en la creación, se requieren items en el mismo POST /ventas.'
+        );
+        e.status = 400;
+        throw e;
+      }
+      if (aCuentaIn - total > 0.01) {
+        const e = new Error('El monto a cuenta no puede superar el total.');
+        e.status = 400;
+        throw e;
+      }
+
+      await registrarCobranzaACuentaPorVenta(
+        {
+          cliente_id: cliId,
+          vendedor_id: vendId,
+          fecha: fechaDT,
+          montoACuenta: aCuentaIn,
+          venta_id: venta.id,
+          observacionesExtra: `Pago inicial a cuenta · Venta #${venta.id}`
+        },
+        t
+      );
     }
 
     await t.commit();
@@ -440,27 +601,26 @@ export const CR_Venta_CTS = async (req, res) => {
       if (!t.finished) await t.rollback();
     } catch {}
 
-    if (err?.message === 'CLIENTE_NO_ENCONTRADO') {
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // Errores específicos de reparto
+    // ======================================================
+    if (err?.message === 'REPARTO_NO_ENCONTRADO') {
       return res.status(404).json({
         code: 'NOT_FOUND',
-        mensajeError: 'Cliente no encontrado.'
+        mensajeError: 'Reparto no encontrado.'
       });
     }
-    if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
-      return res.status(404).json({
-        code: 'NOT_FOUND',
-        mensajeError: 'Vendedor no encontrado.'
-      });
-    }
-    if (err?.message === 'VENDEDOR_INACTIVO') {
+    if (err?.message === 'REPARTO_INACTIVO') {
       return res.status(400).json({
-        code: 'VENDOR_INACTIVE',
-        mensajeError: 'El vendedor está inactivo.'
+        code: 'BAD_REQUEST',
+        mensajeError: 'El reparto está inactivo.'
       });
     }
+
     if (err?.status === 400) {
       return res.status(400).json({
-        code: 'MODEL_VALIDATION',
+        code: 'BAD_REQUEST',
         mensajeError: err.message
       });
     }
@@ -729,8 +889,8 @@ export const UR_Venta_RecalcularTotal_CTS = async (req, res) => {
       st === 404
         ? 'NOT_FOUND'
         : st === 400
-        ? 'MODEL_VALIDATION'
-        : 'SERVER_ERROR';
+          ? 'MODEL_VALIDATION'
+          : 'SERVER_ERROR';
     const msg =
       err?.message ||
       (st === 404 ? 'Venta no encontrada.' : 'No se pudo recalcular.');
@@ -860,6 +1020,7 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
         {
           cliente_id: cliId,
           vendedor_id: vendId,
+          reparto_id: repId,
           fecha: fechaDT,
           tipo: tipoVenta, // en este flujo, normalmente "fiado"
           total_neto: 0,
@@ -1007,16 +1168,19 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
 // =============================================
 // GET /ventas/deudores-fiado
 // Devuelve deudores considerando cobranzas:
-// - Suma ventas fiado confirmadas
-// - Resta monto_aplicado en cobranza_aplicaciones
+// - Incluye ventas fiado y a_cuenta confirmadas
+// - Calcula saldo = total_neto - pagado
+//   pagado = MAX(ventas.monto_a_cuenta, SUM(cobranza_aplicaciones.monto_aplicado))
+//   (compatibilidad: evita doble conteo si ya actualizás monto_a_cuenta)
 // - Solo incluye ventas con saldo > 0
 // =============================================
 export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
   try {
-    // 1) Traer todas las ventas fiado confirmadas
-    const ventasFiado = await VentasModel.findAll({
+    // Benjamin Orellana - 17-01-2026
+    // Incluir también ventas tipo "a_cuenta" porque también generan deuda
+    const ventasDeuda = await VentasModel.findAll({
       where: {
-        tipo: 'fiado',
+        tipo: { [Op.in]: ['fiado', 'a_cuenta'] },
         estado: 'confirmada'
       },
       include: [
@@ -1033,16 +1197,17 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
       ],
       order: [
         ['cliente_id', 'ASC'],
-        ['fecha', 'DESC']
+        ['fecha', 'DESC'],
+        ['id', 'DESC']
       ]
     });
 
-    if (!ventasFiado.length) {
+    if (!ventasDeuda.length) {
       return res.json([]);
     }
 
-    // 2) Buscar aplicaciones de cobranza para esas ventas usando SQL crudo
-    const ventasIds = ventasFiado.map((v) => v.id);
+    // 2) Buscar aplicaciones de cobranza para esas ventas (solo venta_id != null)
+    const ventasIds = ventasDeuda.map((v) => v.id);
 
     const [appsRows] = await db.query(
       `
@@ -1050,7 +1215,8 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
         venta_id,
         SUM(monto_aplicado) AS total_aplicado
       FROM cobranza_aplicaciones
-      WHERE venta_id IN (:ventasIds)
+      WHERE venta_id IS NOT NULL
+        AND venta_id IN (:ventasIds)
       GROUP BY venta_id
       `,
       {
@@ -1065,22 +1231,27 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
       appsByVenta.set(ventaId, totalAplicado);
     }
 
-    // 3) Armar resumen por cliente considerando el saldo pendiente
+    // 3) Armar resumen por cliente considerando saldo pendiente real
     const hoy = new Date();
     const map = new Map();
 
-    for (const v of ventasFiado) {
+    for (const v of ventasDeuda) {
       const cli = v.cliente;
       if (!cli) continue;
 
       const totalVenta = Number(v.total_neto) || 0;
-      const aplicado = appsByVenta.get(v.id) || 0;
-      const saldo = Math.max(0, totalVenta - aplicado);
 
-      // Si la venta está totalmente cobrada, la ignoramos
-      if (saldo <= 0.01) {
-        continue;
-      }
+      // Benjamin Orellana - 17-01-2026
+      // Fuente canónica: ventas.monto_a_cuenta
+      // Compatibilidad: si hay histórico de apps, tomamos el máximo para no duplicar.
+      const aCuentaVenta = Number(v.monto_a_cuenta) || 0;
+      const aplicadoApps = appsByVenta.get(v.id) || 0;
+      const pagado = Math.max(aCuentaVenta, aplicadoApps);
+
+      const saldo = Math.max(0, totalVenta - pagado);
+
+      // Si está totalmente cobrada, la ignoramos
+      if (saldo <= 0.01) continue;
 
       const key = cli.id;
       const existente = map.get(key) || {
@@ -1094,7 +1265,6 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
         ventas: []
       };
 
-      // sumamos solo el saldo pendiente
       existente.total_pendiente += saldo;
 
       // días de atraso (desde la fecha de la venta)
@@ -1105,7 +1275,6 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
         existente.dias_max_atraso = diffDias;
       }
 
-      // guardamos la venta con su saldo pendiente
       existente.ventas.push({
         id: v.id,
         fecha: v.fecha,
@@ -1113,8 +1282,11 @@ export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
         vendedor_nombre: v.vendedor?.nombre || null,
         tipo: v.tipo,
         estado: v.estado,
-        total_neto: totalVenta, // total original
-        saldo: saldo, // saldo pendiente real
+        total_neto: totalVenta,
+        monto_a_cuenta: aCuentaVenta,
+        aplicado_cobranzas: aplicadoApps,
+        pagado: pagado,
+        saldo: saldo,
         observaciones: v.observaciones
       });
 

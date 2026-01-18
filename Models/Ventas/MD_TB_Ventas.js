@@ -39,6 +39,15 @@ export const VentasModel = db.define(
       allowNull: false
     },
 
+    // ======================================================
+    // Benjamin Orellana - 17-01-2026
+    // Se agrega reparto_id para snapshot de reparto al vender
+    // ======================================================
+    reparto_id: {
+      type: DataTypes.INTEGER.UNSIGNED,
+      allowNull: true
+    },
+
     fecha: {
       type: DataTypes.DATE, // DATETIME
       allowNull: false

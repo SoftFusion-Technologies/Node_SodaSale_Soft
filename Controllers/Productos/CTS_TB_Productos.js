@@ -18,8 +18,8 @@
 
 import { ProductosModel } from '../../Models/Productos/MD_TB_Productos.js';
 import { Op } from 'sequelize';
-
-// ---------- Helpers chiquitos y útiles ----------
+import db from '../../DataBase/db.js';
+// ---------- Helpers útiles ----------
 
 // Quitar claves vacías ('', null, undefined) para no ensuciar updates
 const stripEmpty = (obj = {}) => {
@@ -294,51 +294,99 @@ export const UR_Producto_CTS = async (req, res) => {
 
 // ---------- ELIMINAR (DELETE /productos/:id) ----------
 export const ER_Producto_CTS = async (req, res) => {
+  const t = await db.transaction();
   try {
     const id = Number(req.params.id);
-    // Hard delete por defecto. Si viene ?soft=1 (o true), hace baja lógica.
-    const soft = ['1', 'true', 'si', 'sí', 'soft'].includes(
-      String(req.query.soft || '').toLowerCase()
+
+    const force = ['1', 'true', 'si', 'sí', 'force'].includes(
+      String(req.query.force || '').toLowerCase()
     );
 
-    console.log('[ER_Producto_CTS] INICIO', { id, soft });
-
     if (!Number.isFinite(id)) {
+      await t.rollback();
       return res.status(400).json({ code: 'BAD_REQUEST', mensajeError: 'ID inválido' });
     }
 
-    const existe = await ProductosModel.findByPk(id);
+    const existe = await ProductosModel.findByPk(id, { transaction: t });
     if (!existe) {
+      await t.rollback();
       return res.status(404).json({ code: 'NOT_FOUND', mensajeError: 'Producto no encontrado' });
     }
 
-    if (!soft) {
-      // HARD DELETE (default)
-      const deleted = await ProductosModel.destroy({ where: { id }, limit: 1 });
-      console.log('[ER_Producto_CTS] destroy → deleted count:', deleted);
-      if (deleted === 0) {
-        return res.status(404).json({ code: 'NOT_FOUND', mensajeError: 'No se pudo eliminar (ya no existe)' });
-      }
-      return res.status(204).send(); // 204 No Content
+    // Conteo de ventas asociadas
+    const countRows = await db.query(
+      `SELECT COUNT(*) AS c FROM ventas_detalle WHERE producto_id = :id`,
+      { replacements: { id }, type: db.QueryTypes.SELECT, transaction: t }
+    );
+    const ventasCount = Number(countRows?.[0]?.c || 0);
+
+    // Si hay ventas y NO es force -> bloquear y pedir confirm en front
+    if (ventasCount > 0 && !force) {
+      await t.rollback();
+      return res.status(409).json({
+        code: 'PRODUCT_HAS_SALES',
+        mensajeError: `Este producto tiene ventas asociadas (${ventasCount}).`,
+        meta: { ventasCount }
+      });
     }
 
-    // SOFT DELETE (solo si ?soft=1)
-    const [upd] = await ProductosModel.update(
-      { estado: 'inactivo' },
-      { where: { id }, limit: 1 }
-    );
-    console.log('[ER_Producto_CTS] update estado=inactivo → updated:', upd);
-    const inactivado = await ProductosModel.findByPk(id);
-    return res.json({
-      message: 'Producto dado de baja (estado=inactivo)',
-      producto: inactivado
+    // Si es force, eliminamos hijos primero
+    let deletedDetalle = 0;
+    if (ventasCount > 0 && force) {
+      const [, meta] = await db.query(
+        `DELETE FROM ventas_detalle WHERE producto_id = :id`,
+        { replacements: { id }, transaction: t }
+      );
+      deletedDetalle = Number(meta?.affectedRows || 0);
+    }
+
+    // Eliminar producto
+    const deletedProd = await ProductosModel.destroy({
+      where: { id },
+      limit: 1,
+      transaction: t
     });
+
+    if (deletedProd === 0) {
+      await t.rollback();
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'No se pudo eliminar (ya no existe)'
+      });
+    }
+
+    await t.commit();
+
+    // Podés devolver 204 siempre, pero acá devolvemos info si fue force
+    if (force && ventasCount > 0) {
+      return res.status(200).json({
+        ok: true,
+        message: 'Producto eliminado definitivamente (incluye borrado de ventas_detalle).',
+        meta: { ventasCount, deletedDetalle }
+      });
+    }
+
+    return res.status(204).send();
   } catch (error) {
+    await t.rollback();
+
+    // FK todavía puede saltar si hay otras tablas referenciando productos (stock, etc.)
+    if (error?.name === 'SequelizeForeignKeyConstraintError') {
+      return res.status(409).json({
+        code: 'FK_CONSTRAINT',
+        mensajeError:
+          'No se puede eliminar: existe información asociada en otra tabla por restricción FK.',
+        meta: { constraint: error?.index, table: error?.parent?.sqlMessage }
+      });
+    }
+
     console.error('Error al eliminar producto:', error);
-    return res.status(500).json({ code: 'SERVER_ERROR', mensajeError: error?.message || String(error) });
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: error?.message || String(error)
+    });
   }
 };
-
 
 // ---------- (Opcional) Cambiar estado directo (PATCH /productos/:id/estado) ----------
 export const UR_Producto_Estado_CTS = async (req, res) => {

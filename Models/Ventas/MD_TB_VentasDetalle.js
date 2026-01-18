@@ -39,16 +39,13 @@ export const VentasDetalleModel = db.define(
       allowNull: false
     },
 
+    // Benjamin Orellana - 17/01/2026 - Cambio: cantidad pasa de DECIMAL(12,3) a INT UNSIGNED (solo enteros)
     cantidad: {
-      type: DataTypes.DECIMAL(12, 3),
+      type: DataTypes.INTEGER.UNSIGNED,
       allowNull: false,
       validate: {
-        isDecimal: { args: true, msg: 'cantidad debe ser decimal.' },
-        min: { args: [0.001], msg: 'cantidad debe ser > 0.' }
-      },
-      get() {
-        const v = this.getDataValue('cantidad');
-        return v == null ? v : Number(v);
+        isInt: { args: true, msg: 'cantidad debe ser un entero.' },
+        min: { args: 1, msg: 'cantidad debe ser >= 1.' }
       }
     },
 
