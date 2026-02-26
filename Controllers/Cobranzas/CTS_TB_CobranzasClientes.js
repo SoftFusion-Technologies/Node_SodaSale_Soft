@@ -283,7 +283,8 @@ export const OBR_CobranzaCliente_CTS = async (req, res) => {
 //      aplicaciones: [
 //        { venta_id: 12, monto_aplicado: 2000 },
 //        { venta_id: 14, monto_aplicado: 1500 },
-//        { venta_id: null, monto_aplicado: 1000 } // crédito suelto (opcional)
+//        { venta_id: null, monto_aplicado: 1000, aplica_a: "SALDO_PREVIO" }, // pago a deuda histórica
+//        { venta_id: null, monto_aplicado: 500, aplica_a: "CREDITO" }       // crédito suelto
 //      ]
 //    }
 // ======================================================
@@ -329,6 +330,15 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
       });
     }
 
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // Lock del cliente para serializar aplicaciones sobre saldo previo y evitar dobles imputaciones concurrentes.
+    // ======================================================
+    await ClientesModel.findByPk(cliId, {
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
+
     // Normalizar fecha
     const fechaCobro = parseDate(fecha) || new Date();
 
@@ -358,6 +368,26 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
           code: 'BAD_REQUEST',
           mensajeError: 'venta_id en aplicaciones debe ser numérico o null.'
         });
+      }
+
+      // ======================================================
+      // Benjamin Orellana - 25-02-2026
+      // Validar aplica_a SOLO cuando venta_id es NULL:
+      // - SALDO_PREVIO: pago a deuda histórica
+      // - CREDITO: crédito suelto/anticipo
+      // Si no viene, se asume CREDITO por compatibilidad.
+      // ======================================================
+      const vIdNorm = normOptInt(app.venta_id);
+      if (vIdNorm === null) {
+        const aplicaA = String(app.aplica_a || 'CREDITO').trim().toUpperCase();
+        if (!['CREDITO', 'SALDO_PREVIO'].includes(aplicaA)) {
+          if (!t.finished) await t.rollback();
+          return res.status(400).json({
+            code: 'BAD_REQUEST',
+            mensajeError:
+              "aplica_a debe ser 'CREDITO' o 'SALDO_PREVIO' cuando venta_id es null."
+          });
+        }
       }
     }
 
@@ -418,6 +448,12 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
     const mapVentaMonto = new Map();
     let creditoExplicito = 0;
 
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // Nuevo: acumulador para pagos explícitos de saldo previo (deuda histórica)
+    // ======================================================
+    let saldoPrevioExplicito = 0;
+
     for (const a of appsIn) {
       const monto = moneyRound(Number(a.monto_aplicado));
       if (!Number.isFinite(monto) || monto <= 0) continue;
@@ -425,12 +461,66 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
       const vId = normOptInt(a.venta_id);
 
       if (vId === null) {
-        creditoExplicito = moneyRound(creditoExplicito + monto);
+        const aplicaA = String(a.aplica_a || 'CREDITO').trim().toUpperCase();
+
+        if (aplicaA === 'SALDO_PREVIO') {
+          // Benjamin Orellana - 25-02-2026 - Este monto debe descontar saldo_previo_total, no quedar como crédito suelto
+          saldoPrevioExplicito = moneyRound(saldoPrevioExplicito + monto);
+        } else {
+          // CREDITO (default)
+          creditoExplicito = moneyRound(creditoExplicito + monto);
+        }
       } else {
         mapVentaMonto.set(
           vId,
           moneyRound((mapVentaMonto.get(vId) || 0) + monto)
         );
+      }
+    }
+
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // Validación transaccional: el pago explícito a SALDO_PREVIO no puede superar el saldo previo pendiente.
+    // Se calcula: sum(DEBE saldo_previo) - sum(aplicado SALDO_PREVIO).
+    // ======================================================
+    if (saldoPrevioExplicito > 0.01) {
+      const [rowsSaldoPrev] = await db.query(
+        `
+        SELECT
+          COALESCE((
+            SELECT SUM(m.monto)
+            FROM cxc_movimientos m
+            WHERE m.cliente_id = :clienteId
+              AND m.origen_tipo = 'saldo_previo'
+              AND m.signo = 1
+          ), 0) AS debe_saldo_previo,
+          COALESCE((
+            SELECT SUM(ca.monto_aplicado)
+            FROM cobranza_aplicaciones ca
+            JOIN cobranzas_clientes cc ON cc.id = ca.cobranza_id
+            WHERE cc.cliente_id = :clienteId
+              AND ca.venta_id IS NULL
+              AND ca.aplica_a = 'SALDO_PREVIO'
+          ), 0) AS aplicado_saldo_previo
+        `,
+        { replacements: { clienteId: cliId }, transaction: t }
+      );
+
+      const debe = Number(rowsSaldoPrev?.[0]?.debe_saldo_previo || 0);
+      const aplicado = Number(rowsSaldoPrev?.[0]?.aplicado_saldo_previo || 0);
+      const disponible = moneyRound(Math.max(0, debe - aplicado));
+
+      if (saldoPrevioExplicito - disponible > 0.01) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError:
+            'El monto aplicado a saldo previo supera el saldo previo pendiente.',
+          tips: [
+            `Saldo previo pendiente: ${disponible}`,
+            `Monto aplicado a saldo previo: ${saldoPrevioExplicito}`
+          ]
+        });
       }
     }
 
@@ -483,7 +573,8 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
     }
 
     // 2) Si NO vinieron aplicaciones (map vacío y sin crédito explícito), auto aplicar FIFO
-    const huboAppsExplicitas = mapVentaMonto.size > 0 || creditoExplicito > 0;
+    const huboAppsExplicitas =
+      mapVentaMonto.size > 0 || creditoExplicito > 0 || saldoPrevioExplicito > 0;
 
     if (!huboAppsExplicitas) {
       const { appRows, restante } = await aplicarPagoFIFO({
@@ -500,20 +591,35 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
         rowsApps.push({
           cobranza_id: nueva.id,
           venta_id: null,
-          monto_aplicado: restante
+          monto_aplicado: restante,
+          // Benjamin Orellana - 25-02-2026 - En modo FIFO automático, el sobrante siempre queda como crédito suelto
+          aplica_a: 'CREDITO'
         });
       }
     } else {
-      // 3) Si vinieron apps explícitas y además vino crédito explícito, lo guardamos tal cual
+      // 3) Si vinieron apps explícitas y además vino saldo previo explícito, lo guardamos tal cual
+      if (saldoPrevioExplicito > 0.01) {
+        rowsApps.push({
+          cobranza_id: nueva.id,
+          venta_id: null,
+          monto_aplicado: saldoPrevioExplicito,
+          // Benjamin Orellana - 25-02-2026 - Marca explícita para descontar deuda histórica en el cálculo de saldo_previo_total
+          aplica_a: 'SALDO_PREVIO'
+        });
+      }
+
+      // 4) Si vinieron apps explícitas y además vino crédito explícito, lo guardamos tal cual
       if (creditoExplicito > 0.01) {
         rowsApps.push({
           cobranza_id: nueva.id,
           venta_id: null,
-          monto_aplicado: creditoExplicito
+          monto_aplicado: creditoExplicito,
+          // Benjamin Orellana - 25-02-2026 - Crédito suelto/anticipo (no afecta saldo_previo_total)
+          aplica_a: 'CREDITO'
         });
       }
 
-      // 4) Si apps explícitas no cubren el total, el resto también va a crédito suelto (determinista)
+      // 5) Si apps explícitas no cubren el total, el resto también va a crédito suelto (determinista)
       const sumRows = moneyRound(
         rowsApps.reduce((acc, r) => acc + Number(r.monto_aplicado || 0), 0)
       );
@@ -523,7 +629,9 @@ export const CR_CobranzaCliente_CTS = async (req, res) => {
         rowsApps.push({
           cobranza_id: nueva.id,
           venta_id: null,
-          monto_aplicado: resto
+          monto_aplicado: resto,
+          // Benjamin Orellana - 25-02-2026 - Resto determinista siempre a crédito suelto
+          aplica_a: 'CREDITO'
         });
       }
     }

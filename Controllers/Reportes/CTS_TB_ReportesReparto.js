@@ -494,6 +494,34 @@ export const OBR_ReporteRepartoCobranza_CTS = async (req, res) => {
 
 function buildReporteRepartoCobranzaHtml(data) {
   const { filtros, reparto, resumen, clientes } = data;
+
+  // ======================================================
+  // Benjamin Orellana - 25-02-2026
+  // FIX: Recalcular KPIs desde "clientes" (ya filtrado/seleccionado) para que el PDF refleje filtros reales.
+  // Evita que el header/KPIs queden con valores del reparto completo cuando se imprime un subconjunto.
+  // ======================================================
+  const clientesArr = Array.isArray(clientes) ? clientes : [];
+  const kpi_total_clientes = clientesArr.length;
+  const kpi_total_clientes_con_deuda = clientesArr.filter(
+    (it) => Number(it?.deuda_total || 0) > 0.01
+  ).length;
+  const kpi_deuda_total_zona = Number(
+    clientesArr
+      .reduce((acc, it) => acc + Number(it?.deuda_total || 0), 0)
+      .toFixed(2)
+  );
+
+  // ======================================================
+  // Benjamin Orellana - 25-02-2026
+  // Compat: si el template o futuros usos requieren "resumen", sincronizamos valores recalculados sin romper estructura.
+  // ======================================================
+  const resumenSafe = {
+    ...(resumen || {}),
+    total_clientes: kpi_total_clientes,
+    total_clientes_con_deuda: kpi_total_clientes_con_deuda,
+    deuda_total_zona: kpi_deuda_total_zona
+  };
+
   const ahora = new Date().toLocaleString('es-AR', {
     day: '2-digit',
     month: '2-digit',
@@ -511,7 +539,7 @@ function buildReporteRepartoCobranzaHtml(data) {
     .filter(Boolean)
     .join(' · ');
 
-  const clientesHtml = (clientes || [])
+  const clientesHtml = (clientesArr || [])
     .map((item) => {
       const { cliente, deuda_total, resumen_fiado, productos_sugeridos } = item;
       const resumenFiado = resumen_fiado || {
@@ -1009,15 +1037,15 @@ function buildReporteRepartoCobranzaHtml(data) {
     <section class="kpis">
       <div class="kpi-card">
         <div class="kpi-label">Clientes en zona</div>
-        <div class="kpi-value">${resumen.total_clientes || 0}</div>
+        <div class="kpi-value">${resumenSafe.total_clientes || 0}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Clientes con deuda</div>
-        <div class="kpi-value">${resumen.total_clientes_con_deuda || 0}</div>
+        <div class="kpi-value">${resumenSafe.total_clientes_con_deuda || 0}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Deuda total zona</div>
-        <div class="kpi-value">${moneyAR(resumen.deuda_total_zona || 0)}</div>
+        <div class="kpi-value">${moneyAR(resumenSafe.deuda_total_zona || 0)}</div>
       </div>
     </section>
 
@@ -1041,14 +1069,77 @@ function buildReporteRepartoCobranzaHtml(data) {
 /* ============================================================
  * 4) Endpoint PDF
  * ============================================================ */
-
 export const OBR_ReporteRepartoCobranzaPDF_CTS = async (req, res) => {
   try {
     const data = await obtenerReporteRepartoCobranzaDatos(req.query || {});
+
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // Nuevo: permitir imprimir un subconjunto de clientes del reparto.
+    // Query: cliente_ids=20,35,99
+    // ======================================================
+    const rawIds = String(req.query?.cliente_ids || '').trim();
+    const clienteIds = rawIds
+      ? Array.from(
+          new Set(
+            rawIds
+              .split(',')
+              .map((x) => Number(String(x).trim()))
+              .filter((n) => Number.isFinite(n) && n > 0)
+          )
+        )
+      : [];
+
+    if (clienteIds.length > 0 && Array.isArray(data?.clientes)) {
+      const idSet = new Set(clienteIds.map((n) => Number(n)));
+
+      const filtered = data.clientes.filter((it) => {
+        const cid = Number(it?.cliente?.id);
+        return Number.isFinite(cid) && idSet.has(cid);
+      });
+
+      // Benjamin Orellana - 25-02-2026 - Reemplaza clientes por el subconjunto seleccionado
+      data.clientes = filtered;
+
+      // Benjamin Orellana - 25-02-2026 - Recalcula totales del reporte para que el PDF no muestre KPIs del reparto completo
+      const deudaTotal = Number(
+        (filtered || []).reduce(
+          (acc, it) => acc + Number(it?.deuda_total || 0),
+          0
+        ).toFixed(2)
+      );
+
+      const clientesTotal = filtered.length;
+      const clientesConDeuda = filtered.filter(
+        (it) => Number(it?.deuda_total || 0) > 0.01
+      ).length;
+
+      // Si tu data ya trae resumen/kpis, los actualizamos sin romper compat
+      if (data?.resumen && typeof data.resumen === 'object') {
+        data.resumen = {
+          ...data.resumen,
+          clientes_total: clientesTotal,
+          clientes_con_deuda: clientesConDeuda,
+          deuda_total: deudaTotal
+        };
+      } else {
+        // Benjamin Orellana - 25-02-2026 - Fallback: genera resumen si no existía
+        data.resumen = {
+          clientes_total: clientesTotal,
+          clientes_con_deuda: clientesConDeuda,
+          deuda_total: deudaTotal
+        };
+      }
+
+      // Benjamin Orellana - 25-02-2026 - Flag útil para título/encabezado en HTML si querés diferenciar "seleccionados"
+      data._solo_seleccionados = true;
+      data._cliente_ids = clienteIds;
+    }
+
     const html = buildReporteRepartoCobranzaHtml(data);
 
     const browser = await puppeteer.launch({
-      headless: 'new', // o true según tu versión
+      headless: 'new',
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
 
@@ -1064,10 +1155,18 @@ export const OBR_ReporteRepartoCobranzaPDF_CTS = async (req, res) => {
     await browser.close();
 
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      'inline; filename="reporte-reparto-cobranza.pdf"'
-    );
+
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // Nombre de archivo: si hay selección, se marca "seleccionados"
+    // ======================================================
+    const repartoId = req.query?.reparto_id || 'reparto';
+    const filename =
+      clienteIds.length > 0
+        ? `reporte-reparto-cobranza_${repartoId}_seleccionados.pdf`
+        : `reporte-reparto-cobranza_${repartoId}.pdf`;
+
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
     return res.send(pdfBuffer);
   } catch (err) {
     console.error('OBR_ReporteRepartoCobranzaPDF_CTS error:', err);

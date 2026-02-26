@@ -76,7 +76,8 @@ export const CxcMovimientosModel = db.define(
         'cobranza',
         'ajuste',
         'nota_credito',
-        'nota_debito'
+        'nota_debito',
+        'saldo_previo' // Benjamin Orellana - 24-02-2026 se adiciona “cargar saldo previo”
       ),
       allowNull: false
     },

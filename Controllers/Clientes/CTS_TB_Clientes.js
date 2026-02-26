@@ -560,23 +560,20 @@ export const CR_Cliente_CTS = async (req, res) => {
       });
     }
 
-    const calleTrim = trimStr(direccion_calle);
-    if (!calleTrim) {
+    // Benjamin Orellana - 24-02-2026 - El reparto pasa a ser obligatorio en alta de clientes por nuevo requerimiento funcional.
+    const repartoParsed = toNumOrNull(reparto_id);
+    if (repartoParsed == null) {
       if (!t.finished) await t.rollback();
       return res.status(400).json({
         code: 'BAD_REQUEST',
-        mensajeError: 'La calle es obligatoria.'
+        mensajeError: 'El reparto es obligatorio.'
       });
     }
 
+    // Benjamin Orellana - 24-02-2026 - Calle y número dejan de ser obligatorios; se normalizan y se persisten como NULL si llegan vacíos.
+    const calleTrim = trimStr(direccion_calle);
+
     const numeroTrim = trimStr(direccion_numero);
-    if (!numeroTrim) {
-      if (!t.finished) await t.rollback();
-      return res.status(400).json({
-        code: 'BAD_REQUEST',
-        mensajeError: 'El número de calle es obligatorio.'
-      });
-    }
 
     // barrio_id opcional
     const barrioIdParsed = toNumOrNull(barrio_id);
@@ -602,8 +599,9 @@ export const CR_Cliente_CTS = async (req, res) => {
         vendedor_preferido_id: vendIdValidado,
 
         // obligatorios en alta
-        direccion_calle: calleTrim,
-        direccion_numero: numeroTrim,
+        // Benjamin Orellana - 24-02-2026 - Se actualiza regla de negocio: dirección detallada opcional en alta.
+        direccion_calle: toNull(calleTrim),
+        direccion_numero: toNull(numeroTrim),
 
         direccion_piso_dpto: toNull(trimStr(direccion_piso_dpto)),
         referencia: toNull(trimStr(referencia)),
@@ -616,7 +614,7 @@ export const CR_Cliente_CTS = async (req, res) => {
     );
 
     // Benjamin Orellana - 16-01-2026 - Asignación inicial de reparto (opcional)
-    const repartoParsed = toNumOrNull(reparto_id);
+    // Benjamin Orellana - 24-02-2026 - La asignación inicial de reparto ahora es obligatoria por regla de negocio; si falla, se hace rollback de toda la alta.
     if (repartoParsed != null) {
       const r = await asignarClienteAReparto({
         cliente_id: nuevo.id,
@@ -793,7 +791,10 @@ export const UR_Cliente_CTS = async (req, res) => {
     if (documento !== undefined) patch.documento = toNull(trimStr(documento));
 
     // Ciudad: si viene, validar numérica
-    let ciudadFinal = Number(cli.ciudad_id);
+    let ciudadFinal =
+      cli.ciudad_id === null || cli.ciudad_id === undefined
+        ? null
+        : Number(cli.ciudad_id);
     if (ciudad_id !== undefined) {
       const c = toNumOrNull(ciudad_id);
       if (c == null) {
@@ -807,28 +808,12 @@ export const UR_Cliente_CTS = async (req, res) => {
       ciudadFinal = c;
     }
 
-    // Dirección: en update permitimos cambios, pero no permitir vaciar si el campo viene
+    // Benjamin Orellana - 24-02-2026 - Dirección en update: calle y número pasan a ser opcionales y pueden persistirse como NULL si se envían vacíos.
     if (direccion_calle !== undefined) {
-      const calle = trimStr(direccion_calle);
-      if (!calle) {
-        if (!t.finished) await t.rollback();
-        return res.status(400).json({
-          code: 'BAD_REQUEST',
-          mensajeError: 'La calle no puede quedar vacía.'
-        });
-      }
-      patch.direccion_calle = calle;
+      patch.direccion_calle = toNull(trimStr(direccion_calle));
     }
     if (direccion_numero !== undefined) {
-      const num = trimStr(direccion_numero);
-      if (!num) {
-        if (!t.finished) await t.rollback();
-        return res.status(400).json({
-          code: 'BAD_REQUEST',
-          mensajeError: 'El número de calle no puede quedar vacío.'
-        });
-      }
-      patch.direccion_numero = num;
+      patch.direccion_numero = toNull(trimStr(direccion_numero));
     }
 
     if (direccion_piso_dpto !== undefined) {
@@ -877,47 +862,67 @@ export const UR_Cliente_CTS = async (req, res) => {
     // Persistir cambios del cliente
     await cli.update(patch, { transaction: t });
 
+    // Benjamin Orellana - 24-02-2026 - Se consulta reparto activo actual para exigir que el cliente conserve/asigne un reparto activo en edición.
+    const actualActivo = await RepartoClientesModel.findOne({
+      where: { cliente_id: id, estado: 'activo' },
+      transaction: t
+    });
+
+    // Benjamin Orellana - 24-02-2026 - Reparto pasa a ser obligatorio también en edición; si el cliente no tiene reparto activo y no se envía uno, se rechaza la actualización.
+    if (reparto_id === undefined && !actualActivo) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError:
+          'El reparto es obligatorio. Seleccioná un reparto para este cliente.'
+      });
+    }
+
     if (reparto_id !== undefined) {
       const repParsed = toNumOrNull(reparto_id);
 
-      const actualActivo = await RepartoClientesModel.findOne({
-        where: { cliente_id: id, estado: 'activo' },
-        transaction: t
-      });
-
+      // Benjamin Orellana - 24-02-2026 - Se bloquea la desasignación de reparto desde edición porque la regla de negocio exige reparto obligatorio.
       if (repParsed == null) {
-        // DESASIGNAR (solo si hay algo activo)
-        if (actualActivo) {
-          await desasignarRepartoActivo({ cliente_id: id, transaction: t });
-        }
-      } else {
-        // Si es el mismo reparto ya activo, NO reasignar numero_rango
-        if (
-          actualActivo &&
-          Number(actualActivo.reparto_id) === Number(repParsed)
-        ) {
-          // no-op
-        } else {
-          const r = await asignarClienteAReparto({
-            cliente_id: id,
-            reparto_id: repParsed,
-            ciudad_id: ciudadFinal,
-            transaction: t
-          });
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError: 'El reparto es obligatorio.'
+        });
+      }
 
-          if (!r.ok) {
-            if (!t.finished) await t.rollback();
-            return res.status(409).json({
-              code: r.code,
-              mensajeError:
-                'El reparto seleccionado no tiene números de rango disponibles dentro de su rango configurado.',
-              meta: r.meta,
-              tips: [
-                'Seleccioná otro reparto.',
-                'O ajustá el rango del reparto.'
-              ]
-            });
-          }
+      // Benjamin Orellana - 24-02-2026 - Validación explícita para asegurar ciudad disponible al asignar/cambiar reparto.
+      if (ciudadFinal == null || !Number.isFinite(Number(ciudadFinal))) {
+        if (!t.finished) await t.rollback();
+        return res.status(400).json({
+          code: 'BAD_REQUEST',
+          mensajeError:
+            'La ciudad es obligatoria para asignar o cambiar el reparto.'
+        });
+      }
+
+      // Si es el mismo reparto ya activo, NO reasignar numero_rango
+      if (actualActivo && Number(actualActivo.reparto_id) === Number(repParsed)) {
+        // no-op
+      } else {
+        const r = await asignarClienteAReparto({
+          cliente_id: id,
+          reparto_id: repParsed,
+          ciudad_id: ciudadFinal,
+          transaction: t
+        });
+
+        if (!r.ok) {
+          if (!t.finished) await t.rollback();
+          return res.status(409).json({
+            code: r.code,
+            mensajeError:
+              'El reparto seleccionado no tiene números de rango disponibles dentro de su rango configurado.',
+            meta: r.meta,
+            tips: [
+              'Seleccioná otro reparto.',
+              'O ajustá el rango del reparto.'
+            ]
+          });
         }
       }
     }

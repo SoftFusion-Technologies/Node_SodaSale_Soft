@@ -110,6 +110,9 @@ import {
 
 // Importar controladores de ventas inicio
 import {
+  OBRS_CxC_Deudas_CTS,
+  CR_SaldoPrevioCliente_CTS,
+  CR_SaldosPrevios_Masiva_CTS,
   OBRS_Ventas_CTS,
   OBR_Venta_CTS,
   CR_Venta_CTS,
@@ -320,8 +323,13 @@ router.patch('/clientes/:id/estado', UR_Cliente_Estado_CTS);
 router.delete('/clientes/:id', ER_Cliente_CTS);
 
 // ----------------------------------------------------------------
-// Rutas para operaciones CRUD en la tabla 'clientes'
+// Rutas para operaciones CRUD en la tabla 'ventas'
 // ----------------------------------------------------------------
+// Benjamin Orellana - 25/02/2026 - Resumen de deuda por cliente desde CxC (incluye saldo_previo)
+router.get('/cxc/deudas', OBRS_CxC_Deudas_CTS);
+// Benjamin Orellana - 24/02/2026 - Endpoints para carga de saldos previos de CxC desde venta individual y venta masiva.
+router.post('/ventas/saldo-previo', CR_SaldoPrevioCliente_CTS);
+router.post('/ventas/saldos-previos-masiva', CR_SaldosPrevios_Masiva_CTS);
 router.get('/ventas/deudores-fiado', OBRS_VentasDeudoresFiado_CTS);
 router.get('/ventas', OBRS_Ventas_CTS);
 router.get('/ventas/:id', OBR_Venta_CTS);
@@ -453,7 +461,6 @@ router.get('/cxc/clientes/:id/deuda', OBR_CxcDeudaCliente_CTS);
 // REPORTES
 // ===============================
 router.get('/reportes/reparto-cobranza', OBR_ReporteRepartoCobranza_CTS);
-
 
 router.get('/reportes/reparto-cobranza/pdf', OBR_ReporteRepartoCobranzaPDF_CTS);
 

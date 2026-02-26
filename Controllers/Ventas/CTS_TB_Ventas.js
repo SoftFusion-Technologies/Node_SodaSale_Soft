@@ -280,7 +280,19 @@ export const OBRS_Ventas_CTS = async (req, res) => {
       where.reparto_id = repId;
     }
 
-    if (tipo) where.tipo = coerceTipo(tipo);
+    // ======================================================
+    // Benjamin Orellana - 24-02-2026 - Normalizamos tipo para reutilizarlo
+    // y poder aplicar filtro derivado en módulo de deudas (a_cuenta vs fiado)
+    // sin romper compatibilidad histórica.
+    // ======================================================
+    const tipoCoerced = tipo ? coerceTipo(tipo) : null;
+
+    // Si NO es vista de deuda, el filtro de tipo se aplica directo como siempre.
+    // En vista de deuda lo resolvemos más abajo con lógica derivada.
+    if (tipoCoerced && !deuda) {
+      where.tipo = tipoCoerced;
+    }
+
     if (estado && ['confirmada', 'anulada'].includes(String(estado)))
       where.estado = String(estado);
 
@@ -323,8 +335,46 @@ export const OBRS_Ventas_CTS = async (req, res) => {
 
     if (deuda) {
       // Si el caller no fijó tipo/estado, forzamos defaults razonables para deuda
-      if (!tipo) where.tipo = { [Op.in]: ['fiado', 'a_cuenta'] };
+      if (!tipoCoerced) where.tipo = { [Op.in]: ['fiado', 'a_cuenta'] };
       if (!estado) where.estado = 'confirmada';
+
+      // ======================================================
+      // Benjamin Orellana - 24-02-2026 - Filtro de tipo DERIVADO para deuda:
+      // - "a_cuenta" incluye legacy tipo='a_cuenta' y también fiado con monto_a_cuenta > 0
+      // - "fiado" incluye solo fiado puro (monto_a_cuenta <= 0)
+      // Esto alinea el filtro con la UI que muestra tipoUI derivado.
+      // ======================================================
+      if (tipoCoerced === 'a_cuenta') {
+        and.push({
+          [Op.or]: [
+            // Compatibilidad histórica si existen ventas guardadas explícitamente como a_cuenta
+            { tipo: 'a_cuenta' },
+            // Flujo actual de reparto: se guarda como fiado + monto_a_cuenta > 0
+            {
+              [Op.and]: [
+                { tipo: 'fiado' },
+                sWhere(
+                  literal('ROUND(IFNULL(monto_a_cuenta,0), 2)'),
+                  { [Op.gt]: 0 }
+                )
+              ]
+            }
+          ]
+        });
+      } else if (tipoCoerced === 'fiado') {
+        and.push({
+          [Op.and]: [
+            { tipo: 'fiado' },
+            sWhere(
+              literal('ROUND(IFNULL(monto_a_cuenta,0), 2)'),
+              { [Op.lte]: 0 }
+            )
+          ]
+        });
+      } else if (tipoCoerced) {
+        // Para otros tipos (ej. contado) mantenemos filtro directo
+        where.tipo = tipoCoerced;
+      }
 
       // Saldo = total_neto - monto_a_cuenta > 0
       and.push(
@@ -1058,11 +1108,11 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
 
       const deudaInicial = moneyRound(totalCli - montoACuentaCli);
 
-      // Actualizar cabecera
+      // Benjamin Orellana - 24/02/2026 - Evita doble imputación del a cuenta en ventas por reparto masiva; el helper registrarCobranzaACuentaPorVenta ya actualiza ventas.monto_a_cuenta.
       await venta.update(
         {
-          total_neto: totalCli, // total mercadería
-          monto_a_cuenta: montoACuentaCli // pago en el momento
+          total_neto: totalCli // total mercadería
+          // monto_a_cuenta se actualiza únicamente desde registrarCobranzaACuentaPorVenta
         },
         { transaction: t }
       );
@@ -1167,143 +1217,758 @@ export const CR_VentasReparto_Masiva_CTS = async (req, res) => {
 
 // =============================================
 // GET /ventas/deudores-fiado
-// Devuelve deudores considerando cobranzas:
-// - Incluye ventas fiado y a_cuenta confirmadas
-// - Calcula saldo = total_neto - pagado
-//   pagado = MAX(ventas.monto_a_cuenta, SUM(cobranza_aplicaciones.monto_aplicado))
-//   (compatibilidad: evita doble conteo si ya actualizás monto_a_cuenta)
-// - Solo incluye ventas con saldo > 0
+// Benjamin Orellana - 25-02-2026
+// Devuelve deudores en el formato esperado por el front (incluye ventas[]),
+// y además incluye saldo_previo_total desde CxC.
+// Mantiene compatibilidad de ruta para no romper front.
 // =============================================
 export const OBRS_VentasDeudoresFiado_CTS = async (req, res) => {
   try {
-    // Benjamin Orellana - 17-01-2026
-    // Incluir también ventas tipo "a_cuenta" porque también generan deuda
-    const ventasDeuda = await VentasModel.findAll({
-      where: {
-        tipo: { [Op.in]: ['fiado', 'a_cuenta'] },
-        estado: 'confirmada'
-      },
-      include: [
-        {
-          model: ClientesModel,
-          as: 'cliente',
-          attributes: ['id', 'nombre', 'documento', 'email', 'telefono']
-        },
-        {
-          model: VendedoresModel,
-          as: 'vendedor',
-          attributes: ['id', 'nombre']
-        }
-      ],
-      order: [
-        ['cliente_id', 'ASC'],
-        ['fecha', 'DESC'],
-        ['id', 'DESC']
-      ]
-    });
+    const { q, ciudad_id, desde, hasta, saldo_min } = req.query;
 
-    if (!ventasDeuda.length) {
-      return res.json([]);
+    const saldoMin = Number(saldo_min ?? 0.01);
+    const saldoThreshold = Number.isFinite(saldoMin) ? saldoMin : 0.01;
+
+    const whereCliente = [];
+    const repl = { saldoThreshold };
+
+    if (q && String(q).trim()) {
+      repl.q = `%${String(q).trim()}%`;
+      whereCliente.push(
+        '(c.nombre LIKE :q OR c.documento LIKE :q OR c.email LIKE :q)'
+      );
     }
 
-    // 2) Buscar aplicaciones de cobranza para esas ventas (solo venta_id != null)
-    const ventasIds = ventasDeuda.map((v) => v.id);
+    if (ciudad_id !== undefined && ciudad_id !== null && ciudad_id !== '') {
+      const cid = Number(ciudad_id);
+      if (Number.isFinite(cid) && cid > 0) {
+        repl.ciudad_id = cid;
+        whereCliente.push('c.ciudad_id = :ciudad_id');
+      }
+    }
 
-    const [appsRows] = await db.query(
-      `
+    // Benjamin Orellana - 25-02-2026
+    // Filtros de fecha: se aplican sobre ventas.fecha y sobre movimientos/cobranzas según corresponda
+    const whereVentas = [...whereCliente];
+    if (desde) {
+      repl.v_desde = new Date(`${desde}T00:00:00`);
+      whereVentas.push('v.fecha >= :v_desde');
+    }
+    if (hasta) {
+      repl.v_hasta = new Date(`${hasta}T23:59:59`);
+      whereVentas.push('v.fecha <= :v_hasta');
+    }
+
+    const whereMov = [...whereCliente];
+    if (desde) {
+      repl.m_desde = new Date(`${desde}T00:00:00`);
+      whereMov.push('m.fecha >= :m_desde');
+    }
+    if (hasta) {
+      repl.m_hasta = new Date(`${hasta}T23:59:59`);
+      whereMov.push('m.fecha <= :m_hasta');
+    }
+
+    const whereCob = [...whereCliente];
+    if (desde) {
+      repl.c_desde = new Date(`${desde}T00:00:00`);
+      whereCob.push('cc.fecha >= :c_desde');
+    }
+    if (hasta) {
+      repl.c_hasta = new Date(`${hasta}T23:59:59`);
+      whereCob.push('cc.fecha <= :c_hasta');
+    }
+
+    const whereVentasSql = whereVentas.length ? `AND ${whereVentas.join(' AND ')}` : '';
+    const whereMovSql = whereMov.length ? `AND ${whereMov.join(' AND ')}` : '';
+    const whereCobSql = whereCob.length ? `AND ${whereCob.join(' AND ')}` : '';
+
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // 1) Ventas pendientes (fiado / a_cuenta) con saldo calculado.
+    // - Compat: usamos GREATEST(monto_a_cuenta, apps_agg) para evitar doble conteo en data vieja.
+    // - Devolvemos ventas[] en el formato que usa el modal.
+    // ======================================================
+    const sqlVentasPend = `
       SELECT
-        venta_id,
-        SUM(monto_aplicado) AS total_aplicado
-      FROM cobranza_aplicaciones
-      WHERE venta_id IS NOT NULL
-        AND venta_id IN (:ventasIds)
-      GROUP BY venta_id
-      `,
-      {
-        replacements: { ventasIds }
-      }
-    );
+        v.id,
+        v.fecha,
+        v.tipo,
+        v.estado,
+        v.total_neto,
+        v.cliente_id,
 
-    const appsByVenta = new Map();
-    for (const row of appsRows) {
-      const ventaId = Number(row.venta_id);
-      const totalAplicado = Number(row.total_aplicado) || 0;
-      appsByVenta.set(ventaId, totalAplicado);
-    }
+        GREATEST(
+          COALESCE(v.monto_a_cuenta, 0),
+          COALESCE(apps.total_aplicado, 0)
+        ) AS cobrado,
 
-    // 3) Armar resumen por cliente considerando saldo pendiente real
+        ROUND(
+          (COALESCE(v.total_neto, 0) - GREATEST(COALESCE(v.monto_a_cuenta, 0), COALESCE(apps.total_aplicado, 0))),
+          2
+        ) AS saldo,
+
+        c.nombre AS cliente_nombre,
+        c.documento AS cliente_documento,
+        c.telefono AS cliente_telefono,
+        c.email AS cliente_email
+
+      FROM ventas v
+      INNER JOIN clientes c ON c.id = v.cliente_id
+
+      LEFT JOIN (
+        SELECT
+          venta_id,
+          SUM(monto_aplicado) AS total_aplicado
+        FROM cobranza_aplicaciones
+        WHERE venta_id IS NOT NULL
+        GROUP BY venta_id
+      ) apps ON apps.venta_id = v.id
+
+      WHERE v.estado = 'confirmada'
+        AND v.tipo IN ('fiado', 'a_cuenta')
+        ${whereVentasSql}
+
+      HAVING saldo > :saldoThreshold
+      ORDER BY c.id ASC, v.fecha ASC, v.id ASC
+    `;
+
+    const [ventasRows] = await db.query(sqlVentasPend, { replacements: repl });
+
+    // Agrupar ventas por cliente
+    const mapDeudores = new Map();
     const hoy = new Date();
-    const map = new Map();
 
-    for (const v of ventasDeuda) {
-      const cli = v.cliente;
-      if (!cli) continue;
+    for (const r of Array.isArray(ventasRows) ? ventasRows : []) {
+      const cliente_id = Number(r.cliente_id);
+      if (!Number.isFinite(cliente_id)) continue;
 
-      const totalVenta = Number(v.total_neto) || 0;
+      const fechaVenta = r.fecha ? new Date(r.fecha) : null;
+      const dias_atraso =
+        fechaVenta && !Number.isNaN(fechaVenta.getTime())
+          ? Math.max(
+              0,
+              Math.floor(
+                (hoy.getTime() - fechaVenta.getTime()) /
+                  (1000 * 60 * 60 * 24)
+              )
+            )
+          : 0;
 
-      // Benjamin Orellana - 17-01-2026
-      // Fuente canónica: ventas.monto_a_cuenta
-      // Compatibilidad: si hay histórico de apps, tomamos el máximo para no duplicar.
-      const aCuentaVenta = Number(v.monto_a_cuenta) || 0;
-      const aplicadoApps = appsByVenta.get(v.id) || 0;
-      const pagado = Math.max(aCuentaVenta, aplicadoApps);
+      if (!mapDeudores.has(cliente_id)) {
+        mapDeudores.set(cliente_id, {
+          cliente_id,
+          nombre: r.cliente_nombre,
+          documento: r.cliente_documento,
+          telefono: r.cliente_telefono,
+          email: r.cliente_email,
 
-      const saldo = Math.max(0, totalVenta - pagado);
+          total_pendiente: 0,
+          saldo_previo_total: 0,
 
-      // Si está totalmente cobrada, la ignoramos
-      if (saldo <= 0.01) continue;
-
-      const key = cli.id;
-      const existente = map.get(key) || {
-        cliente_id: cli.id,
-        nombre: cli.nombre,
-        documento: cli.documento,
-        email: cli.email,
-        telefono: cli.telefono,
-        total_pendiente: 0,
-        dias_max_atraso: 0,
-        ventas: []
-      };
-
-      existente.total_pendiente += saldo;
-
-      // días de atraso (desde la fecha de la venta)
-      const fechaVenta = new Date(v.fecha);
-      const diffMs = hoy - fechaVenta;
-      const diffDias = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
-      if (diffDias > existente.dias_max_atraso) {
-        existente.dias_max_atraso = diffDias;
+          dias_max_atraso: dias_atraso,
+          ventas: []
+        });
       }
 
-      existente.ventas.push({
-        id: v.id,
-        fecha: v.fecha,
-        vendedor_id: v.vendedor_id,
-        vendedor_nombre: v.vendedor?.nombre || null,
-        tipo: v.tipo,
-        estado: v.estado,
-        total_neto: totalVenta,
-        monto_a_cuenta: aCuentaVenta,
-        aplicado_cobranzas: aplicadoApps,
-        pagado: pagado,
-        saldo: saldo,
-        observaciones: v.observaciones
-      });
+      const d = mapDeudores.get(cliente_id);
 
-      map.set(key, existente);
+      const saldo = Number(r.saldo || 0);
+      d.total_pendiente = Number((Number(d.total_pendiente || 0) + saldo).toFixed(2));
+      d.dias_max_atraso = Math.max(Number(d.dias_max_atraso || 0), dias_atraso);
+
+      d.ventas.push({
+        id: Number(r.id),
+        fecha: r.fecha,
+        vendedor_nombre: null, // Benjamin Orellana - 25-02-2026 - No se infiere aquí para evitar depender de joins que pueden variar
+        tipo: r.tipo,
+        estado: r.estado,
+        total_neto: Number(r.total_neto || 0),
+
+        // Benjamin Orellana - 25-02-2026 - Campos extra no rompen el front; útiles para UX futura
+        cobrado: Number(r.cobrado || 0),
+        saldo: saldo,
+        dias_atraso
+      });
     }
 
-    // 4) Armar array de deudores (solo clientes con saldo > 0)
-    const deudores = Array.from(map.values())
-      .filter((d) => d.total_pendiente > 0.01)
-      .sort((a, b) => b.total_pendiente - a.total_pendiente);
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // 2) Saldo previo pendiente (DEBE saldo_previo - aplicado SALDO_PREVIO)
+    // ======================================================
 
-    return res.json(deudores);
+    const sqlSaldoPrevDebe = `
+      SELECT
+        m.cliente_id,
+        ROUND(SUM(m.monto), 2) AS debe_total,
+        MIN(m.fecha) AS fecha_min
+      FROM cxc_movimientos m
+      INNER JOIN clientes c ON c.id = m.cliente_id
+      WHERE m.origen_tipo = 'saldo_previo'
+        AND m.signo = 1
+        ${whereMovSql}
+      GROUP BY m.cliente_id
+    `;
+    const [rowsDebe] = await db.query(sqlSaldoPrevDebe, { replacements: repl });
+
+    const sqlSaldoPrevAplic = `
+      SELECT
+        cc.cliente_id,
+        ROUND(SUM(ca.monto_aplicado), 2) AS aplicado_total
+      FROM cobranza_aplicaciones ca
+      INNER JOIN cobranzas_clientes cc ON cc.id = ca.cobranza_id
+      INNER JOIN clientes c ON c.id = cc.cliente_id
+      WHERE ca.venta_id IS NULL
+        AND ca.aplica_a = 'SALDO_PREVIO'
+        ${whereCobSql}
+      GROUP BY cc.cliente_id
+    `;
+    const [rowsAplic] = await db.query(sqlSaldoPrevAplic, { replacements: repl });
+
+    const mapDebe = new Map();
+    const mapFechaMin = new Map();
+    for (const r of Array.isArray(rowsDebe) ? rowsDebe : []) {
+      const cid = Number(r.cliente_id);
+      if (!Number.isFinite(cid)) continue;
+      mapDebe.set(cid, Number(r.debe_total || 0));
+      mapFechaMin.set(cid, r.fecha_min || null);
+    }
+
+    const mapAplic = new Map();
+    for (const r of Array.isArray(rowsAplic) ? rowsAplic : []) {
+      const cid = Number(r.cliente_id);
+      if (!Number.isFinite(cid)) continue;
+      mapAplic.set(cid, Number(r.aplicado_total || 0));
+    }
+
+    // Union de clientes: los que tienen ventas pendientes + los que tienen saldo previo pendiente
+    const allClienteIds = new Set([
+      ...Array.from(mapDeudores.keys()),
+      ...Array.from(mapDebe.keys())
+    ]);
+
+    const out = [];
+
+    for (const cid of allClienteIds) {
+      const debe = Number(mapDebe.get(cid) || 0);
+      const aplicado = Number(mapAplic.get(cid) || 0);
+      const saldoPrevPend = Number(Math.max(0, Number((debe - aplicado).toFixed(2))));
+
+      let d = mapDeudores.get(cid);
+
+      // Si no existe por ventas, lo creamos base (deudor solo por saldo previo)
+      if (!d) {
+        // Benjamin Orellana - 25-02-2026 - Buscar datos del cliente en forma segura
+        const [cliRows] = await db.query(
+          `
+          SELECT id AS cliente_id, nombre, documento, telefono, email
+          FROM clientes
+          WHERE id = :clienteId
+          LIMIT 1
+          `,
+          { replacements: { ...repl, clienteId: cid } }
+        );
+
+        const cli = Array.isArray(cliRows) && cliRows[0] ? cliRows[0] : null;
+        if (!cli) continue;
+
+        d = {
+          cliente_id: Number(cli.cliente_id),
+          nombre: cli.nombre,
+          documento: cli.documento,
+          telefono: cli.telefono,
+          email: cli.email,
+
+          total_pendiente: 0,
+          saldo_previo_total: 0,
+          dias_max_atraso: 0,
+          ventas: []
+        };
+      }
+
+      // Sumar saldo previo al total
+      d.saldo_previo_total = saldoPrevPend;
+      d.total_pendiente = Number((Number(d.total_pendiente || 0) + saldoPrevPend).toFixed(2));
+
+      // dias_max_atraso también considera saldo previo por fecha mínima si no hay ventas
+      if ((!d.ventas || !d.ventas.length) && saldoPrevPend > 0.01) {
+        const fmin = mapFechaMin.get(cid);
+        const fd = fmin ? new Date(fmin) : null;
+        if (fd && !Number.isNaN(fd.getTime())) {
+          const dias = Math.max(
+            0,
+            Math.floor((hoy.getTime() - fd.getTime()) / (1000 * 60 * 60 * 24))
+          );
+          d.dias_max_atraso = Math.max(Number(d.dias_max_atraso || 0), dias);
+        }
+      }
+
+      // Filtrar por threshold final (total pendiente real)
+      if (Number(d.total_pendiente || 0) <= saldoThreshold) continue;
+
+      out.push(d);
+    }
+
+    out.sort((a, b) => (Number(b.total_pendiente) || 0) - (Number(a.total_pendiente) || 0));
+
+    return res.json(out);
   } catch (err) {
     console.error('OBRS_VentasDeudoresFiado_CTS error:', err);
     return res.status(500).json({
       code: 'SERVER_ERROR',
       mensajeError: 'No se pudo obtener el resumen de deudores.'
+    });
+  }
+};
+
+// ======================================================
+// Helpers - Saldo previo CxC (deuda histórica)
+// ======================================================
+// Benjamin Orellana - 24/02/2026 - Helper interno para redondeo monetario consistente a 2 decimales.
+const moneyRoundLocal = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// Benjamin Orellana - 24/02/2026 - Helper interno para registrar saldo previo en CxC sin crear una venta.
+async function registrarSaldoPrevioCxC(
+  {
+    cliente_id,
+    fecha,
+    monto,
+    vendedor_id = null,
+    reparto_id = null,
+    descripcion = null
+  },
+  transaction
+) {
+  const cliId = normInt(cliente_id);
+  if (!Number.isFinite(cliId) || cliId <= 0) {
+    const e = new Error('cliente_id inválido.');
+    e.status = 400;
+    throw e;
+  }
+
+  const montoNum = Number(monto);
+  if (!Number.isFinite(montoNum) || montoNum <= 0) {
+    const e = new Error('monto debe ser numérico y mayor a 0.');
+    e.status = 400;
+    throw e;
+  }
+
+  const fechaDT = fecha ? new Date(fecha) : new Date();
+  if (Number.isNaN(fechaDT.getTime())) {
+    const e = new Error('Fecha inválida.');
+    e.status = 400;
+    throw e;
+  }
+
+  // Reutilizamos validaciones ya existentes
+  await validarCliente(cliId, transaction);
+
+  const vendId = normOptInt(vendedor_id);
+  if (vendId != null) {
+    await validarVendedorActivo(vendId, transaction);
+  }
+
+  const repId = normOptInt(reparto_id);
+
+  const montoFinal = moneyRoundLocal(montoNum);
+
+  // Benjamin Orellana - 24/02/2026 - Descripción audit-friendly con contexto de carga inicial.
+  const descripcionFinal =
+    (descripcion && String(descripcion).trim()) ||
+    [
+      'Saldo previo cargado al sistema',
+      vendId ? `Vendedor ${vendId}` : null,
+      repId ? `Reparto ${repId}` : null
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+  const mov = await CxcMovimientosModel.create(
+    {
+      cliente_id: cliId,
+      fecha: fechaDT,
+      signo: 1, // DEBE -> aumenta deuda
+      monto: montoFinal,
+      origen_tipo: 'saldo_previo',
+      origen_id: null, // sin tabla fuente por ahora (válido con uq + NULL en MySQL)
+      descripcion: descripcionFinal
+    },
+    { transaction }
+  );
+
+  return mov;
+}
+
+// Benjamin Orellana - 24/02/2026 - Helper para consultar saldo CxC actual del cliente luego de registrar saldo previo.
+async function obtenerSaldoCxCCliente(clienteId, transaction) {
+  const rows = await CxcMovimientosModel.findAll({
+    attributes: [
+      [
+        db.literal(
+          'ROUND(SUM(CASE WHEN signo = 1 THEN monto ELSE -monto END), 2)'
+        ),
+        'saldo'
+      ]
+    ],
+    where: { cliente_id: Number(clienteId) },
+    raw: true,
+    transaction
+  });
+
+  const saldo = Number(rows?.[0]?.saldo ?? 0);
+  return Number.isFinite(saldo) ? saldo : 0;
+}
+
+// ===============================
+// CREATE - POST /ventas/saldo-previo
+// ===============================
+export const CR_SaldoPrevioCliente_CTS = async (req, res) => {
+  const t = await db.transaction();
+
+  try {
+    const {
+      cliente_id,
+      fecha,
+      monto,
+      vendedor_id, // opcional (contexto de quién cargó / vendedor asociado)
+      reparto_id, // opcional (contexto de reparto desde venta masiva)
+      descripcion // opcional
+    } = req.body || {};
+
+    // Benjamin Orellana - 24/02/2026 - Validación explícita de payload para evitar altas vacías o montos inválidos.
+    if (!cliente_id) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'cliente_id es obligatorio.'
+      });
+    }
+
+    if (monto === undefined || monto === null || monto === '') {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'monto es obligatorio.'
+      });
+    }
+
+    const mov = await registrarSaldoPrevioCxC(
+      {
+        cliente_id,
+        fecha,
+        monto,
+        vendedor_id,
+        reparto_id,
+        descripcion
+      },
+      t
+    );
+
+    const saldoActual = await obtenerSaldoCxCCliente(cliente_id, t);
+
+    await t.commit();
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: 'Saldo previo cargado correctamente.',
+      data: {
+        id: mov.id,
+        cliente_id: Number(cliente_id),
+        fecha: mov.fecha,
+        monto: Number(mov.monto),
+        origen_tipo: mov.origen_tipo,
+        saldo_cxc_actual: saldoActual
+      }
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+
+    if (err?.message === 'CLIENTE_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Cliente no encontrado.'
+      });
+    }
+
+    if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Vendedor no encontrado.'
+      });
+    }
+
+    if (err?.message === 'VENDEDOR_INACTIVO') {
+      return res.status(400).json({
+        code: 'VENDOR_INACTIVE',
+        mensajeError: 'El vendedor está inactivo.'
+      });
+    }
+
+    if (err?.status === 400) {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: err.message
+      });
+    }
+
+    console.error('CR_SaldoPrevioCliente_CTS error:', err);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudo cargar el saldo previo.'
+    });
+  }
+};
+
+// ===============================
+// CREATE - POST /ventas/saldos-previos-masiva
+// ===============================
+export const CR_SaldosPrevios_Masiva_CTS = async (req, res) => {
+  const t = await db.transaction();
+
+  try {
+    const { fecha, vendedor_id, reparto_id, observaciones, items } =
+      req.body || {};
+
+    if (!Array.isArray(items) || items.length === 0) {
+      if (!t.finished) await t.rollback();
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: 'Debe enviar al menos un item de saldo previo.'
+      });
+    }
+
+    // Validación opcional (si viene vendedor, se valida una sola vez)
+    const vendId = normOptInt(vendedor_id);
+    if (vendId != null) {
+      await validarVendedorActivo(vendId, t);
+    }
+
+    const repId = normOptInt(reparto_id);
+
+    // Benjamin Orellana - 24/02/2026 - Normalización de items masivos con filtro de montos > 0.
+    const itemsNormalizados = items.map((it, idx) => {
+      const cliId = normInt(it?.cliente_id);
+      const montoNum = Number(it?.monto);
+
+      if (!Number.isFinite(cliId) || cliId <= 0) {
+        const e = new Error(`Item #${idx + 1}: cliente_id inválido.`);
+        e.status = 400;
+        throw e;
+      }
+
+      if (!Number.isFinite(montoNum) || montoNum <= 0) {
+        const e = new Error(`Item #${idx + 1}: monto debe ser mayor a 0.`);
+        e.status = 400;
+        throw e;
+      }
+
+      return {
+        cliente_id: cliId,
+        monto: moneyRoundLocal(montoNum),
+        descripcion:
+          (it?.descripcion && String(it.descripcion).trim()) ||
+          (observaciones && String(observaciones).trim()) ||
+          null
+      };
+    });
+
+    const creados = [];
+    let totalCargado = 0;
+
+    for (const it of itemsNormalizados) {
+      const mov = await registrarSaldoPrevioCxC(
+        {
+          cliente_id: it.cliente_id,
+          fecha,
+          monto: it.monto,
+          vendedor_id: vendId,
+          reparto_id: repId,
+          descripcion: it.descripcion
+        },
+        t
+      );
+
+      creados.push({
+        id: mov.id,
+        cliente_id: it.cliente_id,
+        monto: it.monto
+      });
+
+      totalCargado += Number(it.monto);
+    }
+
+    totalCargado = moneyRoundLocal(totalCargado);
+
+    await t.commit();
+
+    return res.status(201).json({
+      ok: true,
+      mensaje: `Se cargaron ${creados.length} saldo(s) previo(s).`,
+      meta: {
+        registros: creados.length,
+        totalCargado,
+        vendedor_id: vendId,
+        reparto_id: repId
+      },
+      data: creados
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+
+    if (err?.message === 'CLIENTE_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Alguno de los clientes no existe.'
+      });
+    }
+
+    if (err?.message === 'VENDEDOR_NO_ENCONTRADO') {
+      return res.status(404).json({
+        code: 'NOT_FOUND',
+        mensajeError: 'Vendedor no encontrado.'
+      });
+    }
+
+    if (err?.message === 'VENDEDOR_INACTIVO') {
+      return res.status(400).json({
+        code: 'VENDOR_INACTIVE',
+        mensajeError: 'El vendedor está inactivo.'
+      });
+    }
+
+    if (err?.status === 400) {
+      return res.status(400).json({
+        code: 'BAD_REQUEST',
+        mensajeError: err.message
+      });
+    }
+
+    console.error('CR_SaldosPrevios_Masiva_CTS error:', err);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'No se pudieron cargar los saldos previos.'
+    });
+  }
+};
+
+// ===============================
+// LIST - GET /cxc/deudas
+// Resumen de deuda por cliente desde cxc_movimientos
+// ===============================
+export const OBRS_CxC_Deudas_CTS = async (req, res) => {
+  try {
+    const { page, limit, offset } = parsePagination(req);
+
+    const {
+      q,
+      cliente_id,
+      ciudad_id,
+      desde,
+      hasta,
+      saldo_min
+    } = req.query;
+
+    const saldoMin = Number(saldo_min ?? 0.01);
+    const saldoThreshold = Number.isFinite(saldoMin) ? saldoMin : 0.01;
+
+    const where = [];
+    const repl = {
+      limit,
+      offset,
+      saldoThreshold
+    };
+
+    if (cliente_id) {
+      where.push('c.id = :cliente_id');
+      repl.cliente_id = Number(cliente_id);
+    }
+
+    if (ciudad_id) {
+      where.push('c.ciudad_id = :ciudad_id');
+      repl.ciudad_id = Number(ciudad_id);
+    }
+
+    if (q && String(q).trim()) {
+      const like = `%${String(q).trim()}%`;
+      where.push('(c.nombre LIKE :q OR c.documento LIKE :q OR c.email LIKE :q)');
+      repl.q = like;
+    }
+
+    if (desde) {
+      where.push('m.fecha >= :desde');
+      repl.desde = new Date(`${desde}T00:00:00`);
+    }
+
+    if (hasta) {
+      where.push('m.fecha <= :hasta');
+      repl.hasta = new Date(`${hasta}T23:59:59`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    // Benjamin Orellana - 25/02/2026 - Query principal: saldo total por cliente usando ledger CxC (signo).
+    const sql = `
+      SELECT
+        c.id AS cliente_id,
+        c.nombre,
+        c.documento,
+        c.email,
+        c.telefono,
+        c.ciudad_id,
+
+        ROUND(SUM(CASE WHEN m.signo = 1 THEN m.monto ELSE -m.monto END), 2) AS saldo_total,
+
+        ROUND(SUM(CASE WHEN m.origen_tipo = 'saldo_previo' AND m.signo = 1 THEN m.monto ELSE 0 END), 2) AS saldo_previo_total,
+        ROUND(SUM(CASE WHEN m.origen_tipo = 'venta' AND m.signo = 1 THEN m.monto ELSE 0 END), 2) AS ventas_total,
+        ROUND(SUM(CASE WHEN m.signo = -1 THEN m.monto ELSE 0 END), 2) AS pagos_total,
+
+        MAX(m.fecha) AS ultima_fecha_mov
+      FROM cxc_movimientos m
+      INNER JOIN clientes c ON c.id = m.cliente_id
+      ${whereSql}
+      GROUP BY c.id
+      HAVING saldo_total > :saldoThreshold
+      ORDER BY saldo_total DESC
+      LIMIT :limit OFFSET :offset;
+    `;
+
+    // Count (clientes con saldo > threshold)
+    const sqlCount = `
+      SELECT COUNT(*) AS total
+      FROM (
+        SELECT c.id
+        FROM cxc_movimientos m
+        INNER JOIN clientes c ON c.id = m.cliente_id
+        ${whereSql}
+        GROUP BY c.id
+        HAVING ROUND(SUM(CASE WHEN m.signo = 1 THEN m.monto ELSE -m.monto END), 2) > :saldoThreshold
+      ) t;
+    `;
+
+    const [rows] = await db.query(sql, { replacements: repl });
+    const [countRows] = await db.query(sqlCount, { replacements: repl });
+    const total = Number(countRows?.[0]?.total ?? 0);
+
+    return res.json({
+      data: rows,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        hasPrev: page > 1,
+        hasNext: offset + (rows?.length || 0) < total
+      }
+    });
+  } catch (err) {
+    console.error('OBRS_CxC_Deudas_CTS error:', err);
+    return res.status(500).json({
+      code: 'SERVER_ERROR',
+      mensajeError: 'Error listando deudas por CxC.'
     });
   }
 };

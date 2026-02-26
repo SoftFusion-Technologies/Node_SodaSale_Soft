@@ -40,6 +40,18 @@ export const CobranzaAplicacionesModel = db.define(
       allowNull: true // null => crédito no aplicado
     },
 
+    // Benjamin Orellana - 25-02-2026 - Nuevo: indica si la app (venta_id NULL) aplica a saldo previo o es crédito suelto
+    aplica_a: {
+      type: DataTypes.STRING(20),
+      allowNull: true,
+      validate: {
+        isIn: {
+          args: [['CREDITO', 'SALDO_PREVIO']],
+          msg: 'aplica_a debe ser CREDITO o SALDO_PREVIO.'
+        }
+      }
+    },
+
     monto_aplicado: {
       type: DataTypes.DECIMAL(14, 2),
       allowNull: false,

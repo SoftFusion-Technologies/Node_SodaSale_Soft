@@ -29,7 +29,83 @@ const escapeHtml = (s = '') =>
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 
-const buildHtmlReporteSimple = ({ reporte }) => {
+// ======================================================
+// Benjamin Orellana - 25-02-2026
+// FIX TZ: evitar que fechas "date-only" (YYYY-MM-DD) resten 1 día por parse UTC.
+// Parseamos manualmente a Date local (new Date(y, m-1, d)).
+// Soporta:
+// - Date
+// - "YYYY-MM-DD"
+// - "DD/MM/YYYY"
+// - ISO datetime (se deja new Date para mantener hora real)
+// ======================================================
+const formatFechaDMY = (input) => {
+  if (!input) return '—';
+
+  if (input instanceof Date) {
+    if (Number.isNaN(input.getTime())) return '—';
+    const dd = String(input.getDate()).padStart(2, '0');
+    const mm = String(input.getMonth() + 1).padStart(2, '0');
+    const yyyy = String(input.getFullYear());
+    return `${dd}/${mm}/${yyyy}`;
+  }
+
+  const s = String(input).trim();
+  if (!s) return '—';
+
+  // YYYY-MM-DD (date-only) => parse local (sin TZ shift)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [yy, mm, dd] = s.split('-').map((x) => Number(x));
+    const d = new Date(yy, (mm || 1) - 1, dd || 1);
+    const outDD = String(d.getDate()).padStart(2, '0');
+    const outMM = String(d.getMonth() + 1).padStart(2, '0');
+    const outYY = String(d.getFullYear());
+    return `${outDD}/${outMM}/${outYY}`;
+  }
+
+  // DD/MM/YYYY => parse local
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
+    const [dd, mm, yy] = s.split('/').map((x) => Number(x));
+    const d = new Date(yy, (mm || 1) - 1, dd || 1);
+    const outDD = String(d.getDate()).padStart(2, '0');
+    const outMM = String(d.getMonth() + 1).padStart(2, '0');
+    const outYY = String(d.getFullYear());
+    return `${outDD}/${outMM}/${outYY}`;
+  }
+
+  // ISO datetime u otros formatos => dejamos Date normal
+  const d1 = new Date(s);
+  if (!Number.isNaN(d1.getTime())) {
+    const dd = String(d1.getDate()).padStart(2, '0');
+    const mm = String(d1.getMonth() + 1).padStart(2, '0');
+    const yyyy = String(d1.getFullYear());
+    return `${dd}/${mm}/${yyyy}`;
+  }
+
+  return s;
+};
+
+// ======================================================
+// Benjamin Orellana - 25-02-2026
+// Helper: rango de fechas para encabezado del PDF
+// ======================================================
+const buildRangoFechas = ({ fecha_desde, fecha_hasta }) => {
+  const d = formatFechaDMY(fecha_desde);
+  const h = formatFechaDMY(fecha_hasta);
+
+  // Si no hay ninguna
+  if ((d === '—' || !fecha_desde) && (h === '—' || !fecha_hasta)) {
+    return 'Todo el período';
+  }
+
+  // Si viene una sola
+  if (fecha_desde && (!fecha_hasta || h === '—')) return `Desde ${d}`;
+  if (fecha_hasta && (!fecha_desde || d === '—')) return `Hasta ${h}`;
+
+  return `${d} al ${h}`;
+};
+
+const buildHtmlReporteSimple = ({ reporte, meta }) => {
   const rows = Array.isArray(reporte?.clientes) ? reporte.clientes : [];
 
   const tableRows = rows
@@ -46,6 +122,25 @@ const buildHtmlReporteSimple = ({ reporte }) => {
     })
     .join('');
 
+  // ======================================================
+  // Benjamin Orellana - 25-02-2026
+  // Encabezado: reparto + rango de fechas (con fallbacks seguros)
+  // ======================================================
+  const repartoLabel =
+    meta?.reparto_label ||
+    reporte?.reparto?.nombre ||
+    reporte?.reparto_nombre ||
+    (meta?.reparto_id ? `Reparto ${meta.reparto_id}` : 'Reparto');
+
+  const rangoFechas = buildRangoFechas({
+    fecha_desde: meta?.fecha_desde,
+    fecha_hasta: meta?.fecha_hasta
+  });
+
+  const soloConDeuda = String(meta?.solo_con_deuda || '').trim();
+  const showSoloConDeuda =
+    soloConDeuda === '1' || soloConDeuda === 'true' || soloConDeuda === 'TRUE';
+
   return `<!doctype html>
 <html lang="es">
 <head>
@@ -61,6 +156,63 @@ const buildHtmlReporteSimple = ({ reporte }) => {
     }
 
     .sheet { width: 100%; }
+
+    /* Benjamin Orellana - 25-02-2026 - Encabezado superior del PDF (reparto + rango fechas) */
+    .meta {
+      width: 100%;
+      margin-bottom: 10px;
+      border: 2px solid #111827;
+      padding: 8px 10px;
+      box-sizing: border-box;
+    }
+
+    .meta-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .meta-left {
+      font-size: 13px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 72%;
+    }
+
+    .meta-right {
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+      white-space: nowrap;
+      text-align: right;
+      max-width: 28%;
+    }
+
+    .meta-sub {
+      margin-top: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 11px;
+      color: #111827;
+    }
+
+    .chip {
+      display: inline-block;
+      border: 2px solid #111827;
+      padding: 2px 8px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+      white-space: nowrap;
+    }
 
     table {
       width: 100%;
@@ -107,6 +259,23 @@ const buildHtmlReporteSimple = ({ reporte }) => {
 </head>
 <body>
   <div class="sheet">
+
+    <!-- Benjamin Orellana - 25-02-2026 - Encabezado requerido: reparto + rango de fechas -->
+    <div class="meta">
+      <div class="meta-row">
+        <div class="meta-left">${escapeHtml(repartoLabel)}</div>
+        <div class="meta-right">${escapeHtml(rangoFechas)}</div>
+      </div>
+      <div class="meta-sub">
+        <div>Reporte Simple - Reparto & Cobranza</div>
+        ${
+          showSoloConDeuda
+            ? `<div class="chip">Solo con deuda</div>`
+            : `<div class="chip">Incluye saldados</div>`
+        }
+      </div>
+    </div>
+
     <table>
       <colgroup>
         <col />
@@ -153,7 +322,26 @@ export const exportReporteRepartoCobranzaSimplePDF = async (req, res) => {
     });
 
     const reporte = resp?.data || null;
-    const html = buildHtmlReporteSimple({ reporte });
+
+    // ======================================================
+    // Benjamin Orellana - 25-02-2026
+    // Meta para encabezado del PDF:
+    // - reparto_label: intenta tomarlo del reporte si viene, si no usa fallback "Reparto {id}"
+    // - rango de fechas: se muestra en el encabezado (dd/mm/yyyy)
+    // ======================================================
+    const meta = {
+      reparto_id: reparto_id,
+      fecha_desde: fecha_desde || null,
+      fecha_hasta: fecha_hasta || null,
+      solo_con_deuda: solo_con_deuda || null,
+      reparto_label:
+        reporte?.reparto?.nombre ||
+        reporte?.reparto_nombre ||
+        reporte?.zona_nombre ||
+        null
+    };
+
+    const html = buildHtmlReporteSimple({ reporte, meta });
     const pdfBuffer = await renderHtmlToPdfBufferStandalone(html);
 
     res.setHeader('Content-Type', 'application/pdf');
