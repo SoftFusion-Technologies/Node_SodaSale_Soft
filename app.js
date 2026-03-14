@@ -17,7 +17,6 @@ import path from 'node:path';
 
 const BASE_UPLOAD_DIR = path.join(process.cwd(), 'uploads');
 
-
 import { timeRouter } from './Routes/time.routes.js';
 import { timeGuard } from './Middlewares/timeGuard.js';
 import { initAuthoritativeTime } from './Utils/authoritativeTime.js';
@@ -46,7 +45,14 @@ initRelacionesRepartos();
 const app = express();
 
 /*  🔑 CORS configurado con whitelist y credenciales */
-const CORS_WHITELIST = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+const CORS_WHITELIST = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://soda144.com',
+  'https://soda144.com',
+  'http://www.soda144.com',
+  'https://www.soda144.com'
+];
 
 const corsOptions = {
   origin(origin, cb) {

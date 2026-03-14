@@ -252,6 +252,11 @@ async function obtenerNumeroRangoDisponible({
 // - Deja inactiva cualquier asignación activa previa del cliente (a otros repartos).
 // - Si ya existe registro reparto_id+cliente_id, lo actualiza.
 // - Maneja concurrencia por uq_repcli_reparto_numero con reintentos.
+
+// Benjamin Orellana - 13-03-2026 - Se corrige la asignación para respetar la unicidad real de reparto_clientes:
+// el numero_rango no puede reutilizarse si ya existe en otra fila, aunque esté inactiva.
+// Si el cliente ya tiene histórico en ese reparto, se reactiva esa misma fila.
+// Para clientes nuevos en el reparto, el número libre se calcula considerando todas las filas del reparto.
 async function asignarClienteAReparto({
   cliente_id,
   reparto_id,
@@ -269,10 +274,17 @@ async function asignarClienteAReparto({
     return { ok: true, numero_rango: yaActivo.numero_rango };
   }
 
-  // Desactivar cualquier asignación activa previa del cliente
+  // Benjamin Orellana - 13-03-2026 - Desactivar únicamente asignaciones activas del cliente en otros repartos.
   await RepartoClientesModel.update(
     { estado: 'inactivo' },
-    { where: { cliente_id, estado: 'activo' }, transaction }
+    {
+      where: {
+        cliente_id,
+        estado: 'activo',
+        reparto_id: { [Op.ne]: reparto_id }
+      },
+      transaction
+    }
   );
 
   // Ver si ya existe registro histórico para este reparto+cliente
@@ -281,20 +293,18 @@ async function asignarClienteAReparto({
     transaction
   });
 
-  // Reusar numero_rango si el histórico existe y ese numero no está tomado por otro
-  if (existente?.numero_rango != null) {
-    const tomado = await RepartoClientesModel.findOne({
-      where: {
-        reparto_id,
-        numero_rango: existente.numero_rango,
-        id: { [Op.ne]: existente.id }
+  // Benjamin Orellana - 13-03-2026 - Si ya existe fila histórica del cliente en el mismo reparto,
+  // se reactiva esa misma fila. No se debe crear una nueva por uq_repcli_reparto_cliente.
+  // Tampoco hace falta recalcular numero_rango, porque esa fila ya es dueña de su propio número.
+  if (existente?.id) {
+    await existente.update(
+      {
+        estado: 'activo'
       },
-      transaction
-    });
-    if (!tomado) {
-      await existente.update({ estado: 'activo' }, { transaction });
-      return { ok: true, numero_rango: existente.numero_rango };
-    }
+      { transaction }
+    );
+
+    return { ok: true, numero_rango: existente.numero_rango };
   }
 
   // Asignación automática con reintentos por concurrencia
@@ -302,10 +312,16 @@ async function asignarClienteAReparto({
     const meta = await obtenerNumeroRangoDisponible({
       reparto_id,
       transaction,
-      excluirRepCliId: existente ? existente.id : null
+      excluirRepCliId: null
     });
 
-    if (!meta.ok || meta.sugerido_numero_rango == null) {
+    // Benjamin Orellana - 13-03-2026 - Si no hay metadatos válidos de rango o no hay cupos,
+    // se devuelve el error funcional sin intentar insertar.
+    if (
+      !meta?.ok ||
+      meta?.rango_min == null ||
+      meta?.rango_max == null
+    ) {
       return {
         ok: false,
         code: 'REPARTO_SIN_CUPOS',
@@ -321,33 +337,72 @@ async function asignarClienteAReparto({
       };
     }
 
-    try {
-      if (existente) {
-        await existente.update(
-          {
-            numero_rango: meta.sugerido_numero_rango,
-            estado: 'activo'
-          },
-          { transaction }
-        );
-      } else {
-        await RepartoClientesModel.create(
-          {
-            reparto_id,
-            cliente_id,
-            numero_rango: meta.sugerido_numero_rango,
-            estado: 'activo'
-          },
-          { transaction }
-        );
-      }
+    // Benjamin Orellana - 13-03-2026 - Se recalcula el número disponible real
+    // usando TODAS las filas del reparto, activas e inactivas, porque la UNIQUE
+    // uq_repcli_reparto_numero bloquea reutilizar números ya existentes.
+    const filasDelReparto = await RepartoClientesModel.findAll({
+      where: {
+        reparto_id,
+        numero_rango: {
+          [Op.between]: [meta.rango_min, meta.rango_max]
+        }
+      },
+      attributes: ['id', 'numero_rango'],
+      order: [['numero_rango', 'ASC']],
+      transaction
+    });
 
-      return { ok: true, numero_rango: meta.sugerido_numero_rango };
+    const numerosUsados = new Set(
+      filasDelReparto
+        .map((row) => Number(row.numero_rango))
+        .filter((n) => Number.isFinite(n))
+    );
+
+    let numeroDisponible = null;
+    for (let n = Number(meta.rango_min); n <= Number(meta.rango_max); n += 1) {
+      if (!numerosUsados.has(n)) {
+        numeroDisponible = n;
+        break;
+      }
+    }
+
+    if (numeroDisponible == null) {
+      return {
+        ok: false,
+        code: 'REPARTO_SIN_CUPOS',
+        meta: {
+          reparto_id,
+          reparto_nombre: meta?.reparto?.nombre || null,
+          rango_min: meta?.rango_min ?? null,
+          rango_max: meta?.rango_max ?? null,
+          usados: filasDelReparto.length,
+          capacidad:
+            meta?.capacidad ??
+            Number(meta.rango_max) - Number(meta.rango_min) + 1,
+          disponible: 0
+        }
+      };
+    }
+
+    try {
+      await RepartoClientesModel.create(
+        {
+          reparto_id,
+          cliente_id,
+          numero_rango: numeroDisponible,
+          estado: 'activo'
+        },
+        { transaction }
+      );
+
+      return { ok: true, numero_rango: numeroDisponible };
     } catch (errIns) {
       const isUnique =
         errIns?.name === 'SequelizeUniqueConstraintError' ||
         String(errIns?.original?.code || '').includes('ER_DUP_ENTRY');
 
+      // Benjamin Orellana - 13-03-2026 - Si el conflicto es por concurrencia,
+      // se reintenta recalculando el primer número realmente libre.
       if (!isUnique || intento === 3) throw errIns;
     }
   }
@@ -513,6 +568,223 @@ export const OBR_Cliente_CTS = async (req, res) => {
   }
 };
 
+// Benjamin Orellana - 13-03-2026 - Helpers para identificar correctamente conflictos de unicidad y claves foráneas en alta de clientes, evitando mensajes engañosos y conservando la lógica existente.
+const extractSequelizeConstraintMeta = (err = {}) => {
+  const constraint =
+    err?.parent?.constraint ||
+    err?.original?.constraint ||
+    err?.index ||
+    null;
+
+  const sqlMessage =
+    err?.parent?.sqlMessage ||
+    err?.original?.sqlMessage ||
+    err?.message ||
+    '';
+
+  const table =
+    err?.parent?.table ||
+    err?.original?.table ||
+    null;
+
+  const errors = Array.isArray(err?.errors)
+    ? err.errors.map((e) => ({
+        path: e?.path || null,
+        value: e?.value,
+        message: e?.message || null
+      }))
+    : [];
+
+  const fieldNames = errors.map((e) => e.path).filter(Boolean);
+
+  return {
+    constraint,
+    sqlMessage,
+    table,
+    errors,
+    fieldNames
+  };
+};
+
+// Benjamin Orellana - 13-03-2026 - Se mejora la interpretación de errores UNIQUE para distinguir entre conflictos de documento, asignación de cliente a reparto y número ocupado dentro del reparto.
+const buildClienteUniqueConflictResponse = (err = {}) => {
+  const meta = extractSequelizeConstraintMeta(err);
+
+  const constraintLower = String(meta.constraint || '').toLowerCase();
+  const sqlLower = String(meta.sqlMessage || '').toLowerCase();
+  const fieldsLower = (meta.fieldNames || []).map((f) =>
+    String(f || '').toLowerCase()
+  );
+
+  const hay = (...tokens) =>
+    tokens.some(
+      (token) =>
+        constraintLower.includes(token) ||
+        sqlLower.includes(token) ||
+        fieldsLower.some((f) => f.includes(token))
+    );
+
+  if (
+    hay('uq_clientes_documento') ||
+    hay("for key 'uq_clientes_documento'") ||
+    fieldsLower.includes('documento')
+  ) {
+    return {
+      status: 409,
+      payload: {
+        code: 'DUPLICATE_DOCUMENTO',
+        mensajeError: 'Ya existe un cliente con ese documento.',
+        tips: ['Verificá DNI/CUIT del cliente.']
+      }
+    };
+  }
+
+  if (
+    hay('uq_repcli_reparto_numero') ||
+    hay('reparto_clientes.uq_repcli_reparto_numero')
+  ) {
+    return {
+      status: 409,
+      payload: {
+        code: 'REPARTO_NUMERO_DUPLICATE',
+        mensajeError:
+          'El reparto seleccionado intentó asignar un número de rango que ya está ocupado.',
+        tips: [
+          'Reintentá la operación.',
+          'Revisá la lógica de asignación automática del reparto.',
+          'Si el número inactivo debe poder reutilizarse, hay que ajustar el diseño de la tabla.'
+        ],
+        meta: {
+          constraint: meta.constraint || 'uq_repcli_reparto_numero'
+        }
+      }
+    };
+  }
+
+  if (
+    hay('uq_repcli_reparto_cliente') ||
+    hay('reparto_clientes.uq_repcli_reparto_cliente')
+  ) {
+    return {
+      status: 409,
+      payload: {
+        code: 'REPARTO_CLIENTE_DUPLICATE',
+        mensajeError:
+          'El cliente ya tiene una asignación registrada en ese reparto.',
+        tips: [
+          'Revisá si ya existe una fila inactiva para ese cliente en ese reparto.',
+          'En ese caso conviene reactivarla en lugar de insertar una nueva.'
+        ],
+        meta: {
+          constraint: meta.constraint || 'uq_repcli_reparto_cliente'
+        }
+      }
+    };
+  }
+
+  if (
+    hay('email') &&
+    (hay('unique') || hay('duplicate') || hay('duplic'))
+  ) {
+    return {
+      status: 409,
+      payload: {
+        code: 'DUPLICATE_EMAIL',
+        mensajeError: 'Ya existe un cliente con ese email.',
+        tips: ['Verificá el correo ingresado o usá otro distinto.']
+      }
+    };
+  }
+
+  return {
+    status: 409,
+    payload: {
+      code: 'UNIQUE_CONFLICT',
+      mensajeError:
+        'Se detectó un conflicto de unicidad en una tabla relacionada.',
+      tips: [
+        'Revisá los datos ingresados.',
+        'Verificá el constraint informado por backend.'
+      ],
+      meta: {
+        constraint: meta.constraint || null,
+        fields: meta.fieldNames || []
+      }
+    }
+  };
+};
+// Benjamin Orellana - 13-03-2026 - Traduce errores FK a mensajes más claros para alta de clientes.
+const buildClienteForeignKeyConflictResponse = (err = {}) => {
+  const meta = extractSequelizeConstraintMeta(err);
+
+  const fingerprint = [
+    meta.constraint,
+    meta.table,
+    meta.sqlMessage,
+    ...meta.fieldNames
+  ]
+    .filter(Boolean)
+    .join(' | ')
+    .toLowerCase();
+
+  if (
+    fingerprint.includes('fk_clientes_ciudad') ||
+    fingerprint.includes('idx_clientes_ciudad') ||
+    fingerprint.includes('ciudad_id') ||
+    fingerprint.includes('ciudad')
+  ) {
+    return {
+      status: 400,
+      payload: {
+        code: 'FK_CONFLICT',
+        mensajeError: 'La ciudad seleccionada no existe o no es válida.',
+        tips: ['Seleccioná una ciudad válida.']
+      }
+    };
+  }
+
+  if (
+    fingerprint.includes('fk_cliente_barrio') ||
+    fingerprint.includes('idx_clientes_barrio') ||
+    fingerprint.includes('barrio_id') ||
+    fingerprint.includes('barrio')
+  ) {
+    return {
+      status: 400,
+      payload: {
+        code: 'FK_CONFLICT',
+        mensajeError: 'El barrio seleccionado no existe o no es válido.',
+        tips: ['Seleccioná un barrio válido o dejalo vacío.']
+      }
+    };
+  }
+
+  if (
+    fingerprint.includes('fk_cliente_vendedor_pref') ||
+    fingerprint.includes('vendedor_preferido_id') ||
+    fingerprint.includes('vendedor')
+  ) {
+    return {
+      status: 400,
+      payload: {
+        code: 'FK_CONFLICT',
+        mensajeError: 'El vendedor preferido seleccionado no existe o no es válido.',
+        tips: ['Elegí un vendedor válido o quitá la asignación.']
+      }
+    };
+  }
+
+  return {
+    status: 400,
+    payload: {
+      code: 'FK_CONFLICT',
+      mensajeError:
+        'Uno de los datos relacionados no existe o no es válido.',
+      tips: ['Revisá ciudad, barrio y vendedor preferido.']
+    }
+  };
+};
+
 // ===============================
 // CREATE - POST /clientes
 // ===============================
@@ -540,6 +812,8 @@ export const CR_Cliente_CTS = async (req, res) => {
       // Asignación inicial desde el modal de clientes Benjamin Orellana - 16-01-2026
       reparto_id
     } = req.body || {};
+
+    console.log('Payload recibido:', req.body);
 
     // Único obligatorio anterior: nombre
     if (!nombre || !String(nombre).trim()) {
@@ -575,8 +849,40 @@ export const CR_Cliente_CTS = async (req, res) => {
 
     const numeroTrim = trimStr(direccion_numero);
 
+    // Benjamin Orellana - 13-03-2026 - Normalización anticipada para reutilizar valores y mejorar validaciones previas.
+    const nombreTrim = String(nombre).trim();
+    const telefonoTrim = toNull(trimStr(telefono));
+    const emailTrim = toNull(trimStr(email));
+    const documentoTrim = toNull(trimStr(documento));
+    const pisoDptoTrim = toNull(trimStr(direccion_piso_dpto));
+    const referenciaTrim = toNull(trimStr(referencia));
+    const estadoNormalizado = ['activo', 'inactivo'].includes(
+      String(estado || '')
+        .trim()
+        .toLowerCase()
+    )
+      ? String(estado).trim().toLowerCase()
+      : 'activo';
+
     // barrio_id opcional
     const barrioIdParsed = toNumOrNull(barrio_id);
+
+    // Benjamin Orellana - 13-03-2026 - Validación previa amigable de documento duplicado; la restricción UNIQUE de MySQL sigue siendo la garantía final ante concurrencia.
+    if (documentoTrim) {
+      const yaExisteDocumento = await ClientesModel.findOne({
+        where: { documento: documentoTrim },
+        transaction: t
+      });
+
+      if (yaExisteDocumento) {
+        if (!t.finished) await t.rollback();
+        return res.status(409).json({
+          code: 'DUPLICATE_DOCUMENTO',
+          mensajeError: 'Ya existe un cliente con ese documento.',
+          tips: ['Verificá DNI/CUIT del cliente.']
+        });
+      }
+    }
 
     // Vendedor preferido opcional, si viene se valida activo
     const vendedorParsed = toNumOrNull(vendedor_preferido_id);
@@ -587,10 +893,10 @@ export const CR_Cliente_CTS = async (req, res) => {
 
     const nuevo = await ClientesModel.create(
       {
-        nombre: String(nombre).trim(),
-        telefono: toNull(trimStr(telefono)),
-        email: toNull(trimStr(email)),
-        documento: toNull(trimStr(documento)),
+        nombre: nombreTrim,
+        telefono: telefonoTrim,
+        email: emailTrim,
+        documento: documentoTrim,
 
         // Benjamin Orellana - 16-01-2026 - Persistimos ciudad_id como dato principal
         ciudad_id: ciudadParsed,
@@ -603,12 +909,10 @@ export const CR_Cliente_CTS = async (req, res) => {
         direccion_calle: toNull(calleTrim),
         direccion_numero: toNull(numeroTrim),
 
-        direccion_piso_dpto: toNull(trimStr(direccion_piso_dpto)),
-        referencia: toNull(trimStr(referencia)),
+        direccion_piso_dpto: pisoDptoTrim,
+        referencia: referenciaTrim,
 
-        estado: ['activo', 'inactivo'].includes(String(estado))
-          ? estado
-          : 'activo'
+        estado: estadoNormalizado
       },
       { transaction: t }
     );
@@ -703,10 +1007,98 @@ export const CR_Cliente_CTS = async (req, res) => {
       });
     }
 
+    // Benjamin Orellana - 13-03-2026 - Manejo más preciso de FKs para evitar 500 por referencias inválidas.
+    if (err?.name === 'SequelizeForeignKeyConstraintError') {
+      const fkResp = buildClienteForeignKeyConflictResponse(err);
+      return res.status(fkResp.status).json(fkResp.payload);
+    }
+
+    // Benjamin Orellana - 13-03-2026 - Se corrige el mensaje genérico inválido "documento/email"; ahora se responde según el constraint real que falló.
     if (err?.name === 'SequelizeUniqueConstraintError') {
+      const meta = extractSequelizeConstraintMeta(err);
+
+      console.error('CR_Cliente_CTS UNIQUE DEBUG:', {
+        constraint: meta.constraint,
+        table: meta.table,
+        sqlMessage: meta.sqlMessage,
+        fields: meta.fieldNames,
+        errors: meta.errors
+      });
+
+      const constraintLower = String(meta.constraint || '').toLowerCase();
+      const sqlLower = String(meta.sqlMessage || '').toLowerCase();
+      const fieldsLower = (meta.fieldNames || []).map((f) =>
+        String(f || '').toLowerCase()
+      );
+
+      const hay = (...tokens) =>
+        tokens.some(
+          (token) =>
+            constraintLower.includes(token) ||
+            sqlLower.includes(token) ||
+            fieldsLower.some((f) => f.includes(token))
+        );
+
+      if (
+        hay('uq_clientes_documento') ||
+        hay("for key 'uq_clientes_documento'") ||
+        fieldsLower.includes('documento')
+      ) {
+        return res.status(409).json({
+          code: 'DUPLICATE_DOCUMENTO',
+          mensajeError: 'Ya existe un cliente con ese documento.',
+          tips: ['Verificá DNI/CUIT del cliente.']
+        });
+      }
+
+      if (
+        hay('uq_repcli_reparto_numero') ||
+        hay('reparto_clientes.uq_repcli_reparto_numero')
+      ) {
+        return res.status(409).json({
+          code: 'REPARTO_NUMERO_DUPLICATE',
+          mensajeError:
+            'El reparto seleccionado intentó asignar un número de rango que ya está ocupado.',
+          tips: [
+            'Reintentá la operación.',
+            'Revisá la lógica de asignación automática del reparto.'
+          ],
+          meta: {
+            constraint: meta.constraint || 'uq_repcli_reparto_numero'
+          }
+        });
+      }
+
+      if (
+        hay('uq_repcli_reparto_cliente') ||
+        hay('reparto_clientes.uq_repcli_reparto_cliente')
+      ) {
+        return res.status(409).json({
+          code: 'REPARTO_CLIENTE_DUPLICATE',
+          mensajeError:
+            'El cliente ya tiene una asignación registrada en ese reparto.',
+          tips: [
+            'Revisá si ya existe una fila histórica para ese cliente en ese reparto.',
+            'En ese caso conviene reactivarla en lugar de insertar una nueva.'
+          ],
+          meta: {
+            constraint: meta.constraint || 'uq_repcli_reparto_cliente'
+          }
+        });
+      }
+
       return res.status(409).json({
-        code: 'DUPLICATE',
-        mensajeError: 'Conflicto de unicidad (verificá documento/email).'
+        code: 'UNIQUE_CONFLICT',
+        mensajeError:
+          'Se detectó un conflicto de unicidad en una tabla relacionada.',
+        tips: [
+          'Revisá los datos ingresados.',
+          'Verificá el constraint informado por backend.'
+        ],
+        meta: {
+          constraint: meta.constraint || null,
+          fields: meta.fieldNames || []
+        }
       });
     }
 
@@ -717,7 +1109,6 @@ export const CR_Cliente_CTS = async (req, res) => {
     });
   }
 };
-
 // ===============================
 // UPDATE - PUT /clientes/:id
 // ===============================
